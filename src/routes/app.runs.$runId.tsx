@@ -1,0 +1,2037 @@
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+
+import { Component, type ErrorInfo, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowLeft,
+  BrainCircuit,
+  Camera,
+  Check,
+  CheckCircle2,
+  Copy,
+  ChevronRight,
+  Clock,
+  Download,
+  ExternalLink,
+  FileWarning,
+  Globe,
+  Loader2,
+  Network,
+  Pause,
+  Play,
+  RefreshCw,
+  Send,
+  ShieldCheck,
+  SkipForward,
+  Square,
+  Terminal,
+  Trash2,
+  XCircle,
+} from "lucide-react";
+import { BrowserHandoffPanel } from "@/components/browser-handoff-panel";
+import {
+  runsApi,
+  reliabilityApi,
+  type BrowserHandoff,
+  type RunError,
+  type RunEvent,
+  type RunExecutionState,
+  type QaLiveState,
+  type RunMessage,
+  type RunReport,
+  type V2PolicyDecision,
+  type V2Scenario,
+  type V2TestPlan,
+} from "@/lib/api-client";
+import { videoEvidenceEnabled } from "@/lib/feature-flags";
+import { reportLovableError } from "@/lib/lovable-error-reporting";
+import { notifyCustomerBalanceUpdated } from "@/lib/balance-events";
+import { selectOverviewScreenshot, type ScreenshotPresentationMode } from "@/lib/screenshot-evidence";
+import { IssueDetailView } from "@/components/issue-detail-view";
+import { normalizeStandaloneReport, type ReportIssue } from "@/lib/report-model";
+
+function normalizeRunMessages(value: unknown): RunMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    const authorType = row.authorType === "USER" || row.authorType === "AGENT" || row.authorType === "SYSTEM" ? row.authorType : "SYSTEM";
+    const kind = row.kind === "CONTROL" || row.kind === "APPROVAL" || row.kind === "STATUS" || row.kind === "SUMMARY" || row.kind === "MESSAGE" ? row.kind : "MESSAGE";
+    return [{
+      id: typeof row.id === "string" && row.id ? row.id : `message-${index}`,
+      runId: typeof row.runId === "string" ? row.runId : "",
+      authorId: typeof row.authorId === "string" ? row.authorId : null,
+      authorType,
+      kind,
+      action: typeof row.action === "string" ? row.action : null,
+      body: typeof row.body === "string" ? row.body : String(row.body ?? ""),
+      metadata: row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata) ? row.metadata as Record<string, unknown> : null,
+      idempotencyKey: typeof row.idempotencyKey === "string" ? row.idempotencyKey : null,
+      createdAt: typeof row.createdAt === "string" ? row.createdAt : new Date(0).toISOString(),
+      expiresAt: typeof row.expiresAt === "string" ? row.expiresAt : null,
+    } satisfies RunMessage];
+  });
+}
+
+class RunDetailErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    reportLovableError(error, { boundary: "run_detail_local_error_boundary", componentStack: info.componentStack });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="mx-auto max-w-7xl px-4 py-16 md:px-8">
+          <div className="surface-card border border-warning/30 bg-warning/5 p-6">
+            <div className="flex items-center gap-2 text-warning"><XCircle className="h-5 w-5" /><h2 className="font-display font-semibold">This run detail needs a refresh</h2></div>
+            <p className="mt-2 text-sm text-muted-foreground">The run evidence is still preserved. Refresh this section to try rendering the current report again.</p>
+            <button type="button" onClick={() => this.setState({ hasError: false })} className="mt-5 inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground"><RefreshCw className="h-4 w-4" />Retry run details</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const formatViewportLabel = (viewport: unknown): string => {
+  if (!viewport || typeof viewport !== "object") return "not recorded";
+  const value = viewport as { width?: unknown; height?: unknown; deviceMode?: unknown; isMobile?: unknown };
+  if (typeof value.width !== "number" || typeof value.height !== "number") return "not recorded";
+  const mode = String(value.deviceMode || "").toLowerCase();
+  const device = value.isMobile === true || mode.includes("mobile") || value.width < 600
+    ? "Mobile"
+    : mode.includes("tablet") || value.width < 1100
+      ? "Tablet"
+      : "Desktop";
+  return `${device} · ${value.width}×${value.height}`;
+};
+
+export const Route = createFileRoute("/app/runs/$runId")({
+  head: ({ params }) => ({
+    meta: [
+      { title: `Run ${params.runId} · Matrix QA` },
+      { name: "description", content: "Run report with real evidence." },
+      { name: "robots", content: "noindex" },
+    ],
+  }),
+  component: RunDetailPage,
+});
+
+type Tab = "overview" | "console" | "network" | "screenshots" | "scenarios";
+
+function msToClock(ms: number) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function normalizeExecutionEvent(event: RunExecutionState["events"][number]): RunEvent {
+  const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+  const text = (key: string) => typeof payload[key] === "string" ? String(payload[key]) : undefined;
+  const eventType = event.eventType || "execution-event";
+  return {
+    type: `execution:${eventType}`,
+    timestamp: Math.max(0, Number(event.timestampMs ?? 0)),
+    label: eventType.replaceAll("-", " "),
+    message: text("message") || text("reason"),
+    url: text("url"),
+    subtype: event.phase || "lifecycle",
+    status: typeof payload.status === "number" ? payload.status : undefined,
+    source: "execution-state",
+    executionSequence: event.sequence,
+  };
+}
+
+function mergeRunEvents(reportEvents: RunEvent[] | undefined, executionEvents: RunExecutionState["events"] | undefined): RunEvent[] {
+  const lifecycle = (executionEvents || []).map(normalizeExecutionEvent);
+  const browser = reportEvents || [];
+  const merged = [...lifecycle, ...browser];
+  const seen = new Set<string>();
+  return merged
+    .filter((event) => {
+      const key = `${event.source === "execution-state" ? "execution" : "report"}:${event.executionSequence ?? ""}:${event.type}:${event.timestamp}:${event.message || event.label || event.url || ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.timestamp - b.timestamp);
+}
+
+function duration(sec?: number) {
+  if (sec == null) return "—";
+  return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`;
+}
+
+const MAX_TRANSIENT_RUN_LOAD_RETRIES = 4;
+const MAX_TERMINAL_REPORT_RECONCILIATION_RETRIES = 8;
+const TERMINAL_RUN_STATUSES = new Set(["COMPLETED", "PASSED_WITH_FINDINGS", "PARTIALLY_TESTED", "BLOCKED", "FAILED", "REVIEW_REQUIRED"]);
+
+function isTransientRunLoadError(error: unknown): boolean {
+  const status = typeof error === "object" && error !== null && "status" in error
+    ? Number((error as { status?: unknown }).status)
+    : 0;
+  if ([404, 408, 409, 429].includes(status) || status >= 500) return true;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /run not found|request timed out|service is currently unavailable|failed to fetch|unable to load run/i.test(message);
+}
+
+function reportSummary(r: RunReport) {
+  const s = r.summary ?? {
+    assertionsPassed: 0,
+    assertionsFailed: 0,
+    hardErrorCount: 0,
+    bugCount: 0,
+  };
+  if (r.v2Plan) {
+    const scenarios = Array.isArray(r.v2Plan.scenarios) ? r.v2Plan.scenarios : [];
+    const outcomes = scenarios.map((scenario) => scenario.caseStatus ?? scenario.status);
+    return {
+      passed: outcomes.filter((status) => status === "PASSED").length,
+      failed: outcomes.filter((status) => status === "FAILED" || status === "BLOCKED").length,
+      bugs: r.bugs ?? s.bugCount,
+      scenarios: scenarios.length,
+    };
+  }
+  return {
+    passed: r.passed ?? s.assertionsPassed,
+    failed: r.failed ?? s.assertionsFailed,
+    bugs: r.bugs ?? s.bugCount,
+    scenarios: r.scenarios ?? s.assertionsPassed + s.assertionsFailed,
+  };
+}
+
+function RunDetailPage() {
+  const { runId } = Route.useParams();
+  const navigate = useNavigate();
+  const projectId =
+    typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search).get("projectId")
+      : null;
+  const [report, setReport] = useState<RunReport | null>(null);
+  const [reliability, setReliability] = useState<Awaited<ReturnType<typeof reliabilityApi.run>> | null>(null);
+  const [handoff, setHandoff] = useState<BrowserHandoff | null>(null);
+  const [tab, setTab] = useState<Tab>("overview");
+  const [selected, setSelected] = useState(0);
+  const [selectedIssue, setSelectedIssue] = useState<ReportIssue | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [runIdCopied, setRunIdCopied] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const markdown = useMemo(
+    () => (report ? buildReportMarkdown(report, runId) : ""),
+    [report, runId],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let transientLoadRetries = 0;
+    let terminalReportReconciliationRetries = 0;
+    setError(null);
+
+    if (!projectId) {
+      setReport(null);
+      setError("Project ID is required to load this run report.");
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const loadReport = async () => {
+      try {
+        const [data, currentHandoff, executionState, reliabilityState] = await Promise.all([
+          runsApi.getReport(projectId, runId),
+          runsApi.getHandoff(projectId, runId).catch(() => null),
+          runsApi.getExecutionState(projectId, runId).catch(() => null),
+          reliabilityApi.run(runId).catch(() => null),
+        ]);
+        if (cancelled) return;
+        transientLoadRetries = 0;
+        setError(null);
+        const durableTerminalStatus = executionState?.run?.status && TERMINAL_RUN_STATUSES.has(executionState.run.status)
+          ? executionState.run.status
+          : null;
+        const mergedReport: RunReport = {
+          ...data,
+          ...(durableTerminalStatus ? {
+            status: durableTerminalStatus,
+            incomplete: false,
+            finishedAt: data.finishedAt ?? executionState?.run?.finishedAt ?? undefined,
+            errorMessage: data.errorMessage ?? executionState?.run?.errorMessage ?? null,
+          } : {}),
+          events: mergeRunEvents(data.events, executionState?.events),
+        };
+        setReport(mergedReport);
+        notifyCustomerBalanceUpdated();
+        setHandoff(currentHandoff);
+        setReliability(reliabilityState);
+        const activeStatuses = ["PENDING", "QUEUED", "RUNNING", "AWAITING_PERMISSION"];
+        const reportProjectionPending = Boolean(
+          durableTerminalStatus
+          && (data.status !== durableTerminalStatus || data.incomplete)
+          && terminalReportReconciliationRetries < MAX_TERMINAL_REPORT_RECONCILIATION_RETRIES,
+        );
+        if (reportProjectionPending) terminalReportReconciliationRetries += 1;
+        if (activeStatuses.includes(mergedReport.status) || (mergedReport.incomplete && !TERMINAL_RUN_STATUSES.has(mergedReport.status)) || reportProjectionPending) {
+          timer = window.setTimeout(loadReport, 2500);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        if (isTransientRunLoadError(e) && transientLoadRetries < MAX_TRANSIENT_RUN_LOAD_RETRIES) {
+          transientLoadRetries += 1;
+          setError(null);
+          timer = window.setTimeout(loadReport, 1_000);
+          return;
+        }
+        setError(e instanceof Error ? e.message : "Unable to load run report.");
+      }
+    };
+
+    void loadReport();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [projectId, runId]);
+
+  if (error) return <ErrorState message={error} />;
+  if (!report) return <LoadingState />;
+
+  const s = reportSummary(report);
+  const screenshots = report.screenshots ?? [];
+  const selectedShot = screenshots[selected];
+  const videoStatus = report.artifactStatus?.video?.status ?? (report.finalVideo || report.rawVideo ? "ready" : "not_available");
+  const videoUrl = videoEvidenceEnabled
+    ? videoStatus === "ready"
+      ? report.finalVideo ?? report.rawVideo ?? null
+      : videoStatus === "raw_only"
+        ? report.rawVideo ?? null
+        : null
+    : null;
+  const normalizedIssues = normalizeStandaloneReport(report, runId, projectId ?? undefined).issues;
+
+  const copyMarkdown = async () => {
+    try {
+      await navigator.clipboard.writeText(markdown);
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = markdown;
+      textarea.setAttribute("readonly", "true");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      textarea.remove();
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
+
+  const copyRunId = async () => {
+    try { await navigator.clipboard.writeText(runId); } catch {
+      const textarea = document.createElement("textarea"); textarea.value = runId; textarea.setAttribute("readonly", "true"); textarea.style.position = "fixed"; textarea.style.opacity = "0"; document.body.appendChild(textarea); textarea.select(); document.execCommand("copy"); textarea.remove();
+    }
+    setRunIdCopied(true); window.setTimeout(() => setRunIdCopied(false), 1600);
+  };
+
+  const downloadMarkdown = () => {
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = `matrixqa-run-${report.id ?? report.runId ?? runId}.md`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+  };
+
+  const deleteRun = async () => {
+    if (!projectId || deleting) return;
+    const confirmed = window.confirm("Delete this run's evidence, report, screenshots, video, events, and related operational data from Matrix QA? This cannot be undone.");
+    if (!confirmed) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await runsApi.deleteRun(projectId, runId);
+      await navigate({ to: "/app" });
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : "Unable to delete this run data.");
+      setDeleting(false);
+    }
+  };
+
+  const runIsActive = report.incomplete || ["PENDING", "RUNNING", "AWAITING_PERMISSION"].includes(report.status);
+
+  return (
+    <RunDetailErrorBoundary>
+      <div>
+      <div className="mx-auto max-w-7xl px-4 py-8 md:px-8">
+        <Link
+          to="/app"
+          className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> back to runs
+        </Link>
+
+        <div className="mt-4 flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-3">
+              <h1 className="font-display text-3xl font-semibold tracking-tight">
+                Run <span className="text-primary">{report.id ?? report.runId ?? runId}</span>
+                <button type="button" title="Copy run ID" aria-label="Copy run ID" onClick={() => void copyRunId()} className="inline-flex items-center rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground">{runIdCopied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}</button>
+              </h1>
+              <DetailStatusPill status={report.status} />
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-3 font-mono text-xs text-muted-foreground">
+              {report.targetUrl && (
+                <span className="inline-flex items-center gap-1">
+                  <Globe className="h-3.5 w-3.5" />
+                  {report.targetUrl}
+                </span>
+              )}
+              <span className="text-border">·</span>
+              <span className="inline-flex items-center gap-1">
+                <Clock className="h-3.5 w-3.5" />
+                started {report.startedAt
+                  ? new Date(report.startedAt).toLocaleString()
+                  : "—"} · {duration(report.durationSec)}
+              </span>
+              {report.triggeredBy && (
+                <>
+                  <span className="text-border">·</span>
+                  <span>
+                    by{" "}
+                    {typeof report.triggeredBy === "string"
+                      ? report.triggeredBy
+                      : (report.triggeredBy.name ?? report.triggeredBy.email ?? "user")}
+                  </span>
+                </>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={copyMarkdown}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-3 py-1.5 text-xs hover:bg-accent"
+            >
+              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              {copied ? "Copied" : "Copy markdown"}
+            </button>
+            <button
+              type="button"
+              onClick={downloadMarkdown}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-3 py-1.5 text-xs hover:bg-accent"
+            >
+              <Download className="h-3.5 w-3.5" /> Download
+            </button>
+            {!runIsActive && (
+              <button
+                type="button"
+                onClick={() => void deleteRun()}
+                disabled={deleting}
+                className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/20 disabled:cursor-wait disabled:opacity-60"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> {deleting ? "Deleting…" : "Delete run data"}
+              </button>
+            )}
+            {videoUrl && (
+              <a
+                href={videoUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-3 py-1.5 text-xs hover:bg-accent"
+              >
+                <ExternalLink className="h-3.5 w-3.5" /> Open evidence video
+              </a>
+            )}
+          </div>
+        </div>
+
+        {report.errorMessage && (
+          <div className="mt-5 rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+            <strong>Run diagnostic:</strong> {report.errorMessage}
+          </div>
+        )}
+        {deleteError && (
+          <div className="mt-5 rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+            <strong>Deletion failed:</strong> {deleteError}
+          </div>
+        )}
+        {report.metadata?.queue && <QueueStateNotice queue={report.metadata.queue} />}
+        {report.outcome && <OutcomeNotice report={report} />}
+        {report.controlPlane && <RunControlPlanePanel controlPlane={report.controlPlane} />}
+        {report.incomplete && (
+          <div className="mt-5 rounded-md border border-primary/25 bg-primary/5 p-4 text-sm text-muted-foreground">
+            This run is still processing. The report will refresh automatically when the worker reaches a terminal state.
+          </div>
+        )}
+
+        <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Stat
+            label="Scenarios"
+            value={`${s.passed}/${s.scenarios}`}
+            hint="passed"
+            tone={s.failed > 0 ? "danger" : "success"}
+          />
+          <Stat
+            label="Bugs captured"
+            value={String(s.bugs)}
+            hint={s.bugs ? "needs review" : "clean"}
+            tone={s.bugs ? "danger" : "success"}
+          />
+          <Stat label="Screenshots" value={String(screenshots.length)} hint="artifacts" />
+          <Stat
+            label="Events"
+            value={String(report.events?.length ?? 0)}
+            hint={`${report.errors?.length ?? 0} errors · lifecycle included`}
+            tone={(report.errors?.length ?? 0) ? "danger" : undefined}
+          />
+        </div>
+
+        <section className="surface-card mt-6 overflow-hidden" aria-label="Prioritized defect ledger">
+          <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4"><div><div className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Defect ledger</div><h2 className="mt-1 font-display text-base font-semibold">Prioritized issues</h2><p className="mt-1 text-xs text-muted-foreground">Open any issue to inspect its evidence detail.</p></div><span className="font-mono text-xs text-muted-foreground">{normalizedIssues.length} issue{normalizedIssues.length === 1 ? "" : "s"}</span></header>
+          <div className="divide-y divide-border">{normalizedIssues.map((issue) => <button type="button" key={issue.id} onClick={() => setSelectedIssue(issue)} className="grid w-full gap-3 px-5 py-3 text-left hover:bg-accent/30 md:grid-cols-[100px_minmax(0,1fr)_150px_120px_24px]"><span className={`inline-flex h-fit w-fit rounded border px-2 py-0.5 font-mono text-[10px] uppercase ${issue.severity === "critical" ? "border-destructive/30 bg-destructive/10 text-destructive" : issue.severity === "high" ? "border-warning/30 bg-warning/10 text-warning" : "border-info/30 bg-info/10 text-info"}`}>{issue.severity}</span><span className="min-w-0"><span className="block truncate text-sm font-medium">{issue.title}</span><span className="mt-1 block truncate text-[11px] text-muted-foreground">{issue.summary}</span></span><span className="text-xs text-muted-foreground">{issue.category}</span><span className="text-xs text-muted-foreground">{issue.kind} · {issue.occurrences}×</span><span className="text-muted-foreground">›</span></button>)}{!normalizedIssues.length && <div className="p-6 text-center text-sm text-muted-foreground">No distinct issues were returned.</div>}</div>
+        </section>
+
+        {reliability && <RunReliabilityPanel reliability={reliability} />}
+        {videoUrl ? <EvidenceVideo report={report} url={videoUrl} /> : <EvidenceStatus report={report} />}
+        {projectId && <BrowserHandoffPanel projectId={projectId} runId={runId} handoff={handoff} onChange={setHandoff} />}
+        <ExecutionStatusNotice report={report} />
+        {report.v2Plan && <V2PlanResults plan={report.v2Plan} />}
+
+        {report.aiOverview && <AiOverviewPanel report={report} final />}
+        <div className="mt-8 -mx-4 overflow-x-auto border-b border-border md:mx-0">
+          <div className="flex min-w-max items-center gap-1 px-4 md:min-w-0 md:px-0">
+            {(
+              [
+                { id: "overview", label: "Overview", icon: CheckCircle2 },
+                { id: "screenshots", label: "Screenshots", icon: Camera },
+                { id: "console", label: "Console", icon: Terminal },
+                { id: "network", label: "Events", icon: Network },
+                { id: "scenarios", label: "Assertions", icon: FileWarning },
+              ] as const
+            ).map((t) => {
+              const active = tab === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setTab(t.id)}
+                  className={`relative -mb-px inline-flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 text-sm ${active ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+                >
+                  <t.icon className="h-3.5 w-3.5" />
+                  {t.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-6">
+          {tab === "overview" && <OverviewTab report={report} issues={normalizedIssues} onIssue={setSelectedIssue} />}
+          {tab === "screenshots" && (
+            <ScreenshotsTab report={report} selected={selected} setSelected={setSelected} />
+          )}
+          {tab === "console" && projectId && <RunConsoleTab projectId={projectId} runId={runId} report={report} />}
+          {tab === "network" && <EventsTab report={report} />}
+          {tab === "scenarios" && <AssertionsTab report={report} />}
+        </div>
+      </div>
+      {selectedIssue && <IssueDetailView issue={selectedIssue} onClose={() => setSelectedIssue(null)} />}
+      </div>
+    </RunDetailErrorBoundary>
+  );
+}
+
+function RunControlPlanePanel({ controlPlane }: { controlPlane: NonNullable<RunReport["controlPlane"]> }) {
+  const environment = controlPlane.environment;
+  const dependencies = controlPlane.dependencies;
+  const fixture = controlPlane.fixture;
+  const trusted = controlPlane.disposition === "TRUSTED";
+  return <section className={`mt-5 rounded-md border p-4 ${trusted ? "border-success/25 bg-success/5" : "border-warning/30 bg-warning/5"}`} aria-label="Environment and test-data trust"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Run conditions</div><h2 className="mt-1 font-display text-base font-semibold">{trusted ? "Trusted test conditions" : "Conditions need review"}</h2><p className="mt-1 text-xs text-muted-foreground">This signal describes what Matrix QA verified before the worker started.</p></div><span className={`rounded-full border px-2 py-1 font-mono text-[10px] uppercase tracking-wider ${trusted ? "border-success/30 bg-success/10 text-success" : "border-warning/30 bg-warning/10 text-warning"}`}>{String(controlPlane.disposition || "UNVERIFIED").replaceAll("_", " ")}</span></div><div className="mt-3 grid gap-2 sm:grid-cols-3"><TrustCell label="Environment" value={environment?.healthStatus || "NOT_CONFIGURED"} detail={environment?.passedChecks !== undefined ? `${environment.passedChecks}/${environment.totalChecks} checks passed` : "No health probe"} /><TrustCell label="Dependencies" value={dependencies?.status || "NOT_CHECKED"} detail={dependencies?.healthy !== undefined ? `${dependencies.healthy}/${dependencies.total} healthy` : "No dependency check"} /><TrustCell label="Fixture" value={fixture?.validationStatus || fixture?.status || "NOT_CONFIGURED"} detail={fixture?.name || "No fixture selected"} /></div></section>;
+}
+
+function TrustCell({ label, value, detail }: { label: string; value: string; detail: string }) { return <div className="rounded border border-border/70 bg-surface/40 px-3 py-2"><div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div><div className="mt-1 text-xs font-semibold text-foreground">{value.replaceAll("_", " ")}</div><div className="mt-0.5 truncate text-[11px] text-muted-foreground">{detail}</div></div>; }
+
+function RunReliabilityPanel({ reliability }: { reliability: Awaited<ReturnType<typeof reliabilityApi.run>> }) {
+  const attempts = reliability.attempts || [];
+  const firstFailure = attempts.find((attempt) => attempt.outcome && attempt.outcome !== 'pass');
+  const passes = attempts.filter((attempt) => attempt.outcome === 'pass').length;
+  const gate = reliability.releaseGateDecisions?.[0] as { status?: string; decisionReason?: string } | undefined;
+  return <section className="mt-5 rounded-md border border-primary/20 bg-primary/5 p-4" aria-label="Reliability summary"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Reliability history</div><h2 className="mt-1 font-display text-base font-semibold">Original result stays visible</h2><p className="mt-1 text-xs text-muted-foreground">{attempts.length} linked attempt{attempts.length === 1 ? "" : "s"} · {passes} pass{passes === 1 ? "" : "es"} · {firstFailure ? `first non-pass: ${String(firstFailure.outcome).replaceAll("_", " ")}` : "no non-pass attempt recorded"}</p></div>{gate?.status && <span className={`rounded-full border px-2 py-1 font-mono text-[10px] uppercase tracking-wider ${gate.status === "TRUSTED" ? "border-success/30 bg-success/10 text-success" : gate.status === "BLOCKED" ? "border-destructive/30 bg-destructive/10 text-destructive" : "border-warning/30 bg-warning/10 text-warning"}`}>{gate.status.replaceAll("_", " ")}</span>}</div>{gate?.decisionReason && <p className="mt-3 text-xs text-muted-foreground">{gate.decisionReason}</p>}<div className="mt-3 flex flex-wrap gap-2">{attempts.slice(0, 5).map((attempt) => <span key={attempt.id} className="rounded border border-border bg-surface/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">attempt {attempt.attemptNumber}: {String(attempt.outcome || "inconclusive").replaceAll("_", " ")}{attempt.evidenceComplete ? " · evidence" : " · evidence incomplete"}</span>)}<Link to="/app/reliability" className="ml-auto text-xs font-semibold text-primary">Open reliability history</Link></div></section>;
+}
+
+function QueueStateNotice({ queue }: { queue: NonNullable<RunReport["metadata"]>["queue"] }) {
+  if (!queue) return null;
+  const copy = queue.state === "WAITING_FOR_PROVIDER"
+    ? "Configured test capacity is temporarily full. Your test is protected — nothing is being charged."
+    : queue.state === "WAITING_FOR_ORGANIZATION"
+      ? "Another run is active for your organization. Your test is queued and will start automatically."
+      : queue.state === "EXPIRED"
+        ? "This run expired before provider admission. Nothing was charged. You can try again."
+        : queue.state === "RUNNING"
+          ? "The browser worker is running this test now."
+          : queue.state === "ADMITTED"
+            ? "Your test was admitted and is preparing to run."
+            : "Your test is queued for automatic admission.";
+  const retryAt = queue.retryAt && Number.isFinite(Date.parse(queue.retryAt))
+    ? new Date(queue.retryAt).toLocaleString()
+    : null;
+  const tone = queue.state === "EXPIRED" ? "border-warning/40 bg-warning/10" : queue.state === "WAITING_FOR_PROVIDER" || queue.state === "WAITING_FOR_ORGANIZATION" ? "border-primary/30 bg-primary/5" : "border-border bg-surface-2/30";
+  return (
+    <div className={`mt-5 flex items-start gap-3 rounded-md border p-4 text-sm ${tone}`}>
+      <Clock className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2 font-medium text-foreground">
+          <span>{copy}</span>
+          <span className="rounded-full bg-surface-2 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{queue.state.replaceAll("_", " ")}</span>
+        </div>
+        {queue.reason && <p className="mt-1 text-xs text-muted-foreground">{queue.reason}</p>}
+        {retryAt && queue.state !== "EXPIRED" && <p className="mt-1 text-xs text-muted-foreground">Automatic retry or admission check: {retryAt}.</p>}
+      </div>
+    </div>
+  );
+}
+
+function OutcomeNotice({ report }: { report: RunReport }) {
+  const outcome = report.outcome;
+  if (!outcome) return null;
+  const tone = outcome.status === "COMPLETED" ? "success" : outcome.status === "PASSED_WITH_FINDINGS" ? "warning" : outcome.status === "PARTIALLY_TESTED" || outcome.status === "REVIEW_REQUIRED" || outcome.status === "AWAITING_PERMISSION" ? "warning" : outcome.status === "BLOCKED" ? "danger" : "danger";
+  const classes = tone === "success" ? "border-success/30 bg-success/10" : tone === "danger" ? "border-destructive/40 bg-destructive/10" : "border-warning/40 bg-warning/10";
+  const coverage = outcome.coverage;
+  const findings = outcome.findings;
+  const title = outcome.status === "AWAITING_PERMISSION" ? "Waiting for your decision" : outcome.status === "REVIEW_REQUIRED" ? "Review required" : outcome.status.replaceAll("_", " ");
+  return <div className={`mt-5 rounded-md border p-4 text-sm ${classes}`}><div className="font-medium text-foreground">{title}</div><p className="mt-1 text-muted-foreground">{outcome.message || "All planned scenarios completed without recorded findings."}</p>{coverage && <p className="mt-2 text-xs text-muted-foreground">Coverage: {coverage.completed}/{coverage.planned} scenarios completed · {coverage.blocked} blocked · {coverage.needsReview} needs review{findings ? ` · ${findings.target} target finding${findings.target === 1 ? "" : "s"} · ${findings.evidence} evidence limitation${findings.evidence === 1 ? "" : "s"}` : ""}</p>}</div>;
+}
+
+function ExecutionStatusNotice({ report }: { report: RunReport }) {
+  if (!report.v2Plan) return null;
+  const videoStatus = videoEvidenceEnabled ? report.artifactStatus?.video?.status ?? "not_available" : "disabled";
+  const videoDisabled = !videoEvidenceEnabled || report.artifactStatus?.video?.reason === "disabled by configuration";
+  const message = report.incomplete
+    ? "Execution in progress"
+    : videoDisabled && report.status !== "RUNNING" && report.status !== "PENDING"
+      ? "Execution complete; screenshots only"
+      : report.status === "COMPLETED" && videoStatus !== "ready"
+        ? "Execution complete; processing report"
+      : report.status === "PASSED_WITH_FINDINGS"
+        ? "Completed with findings"
+        : report.status === "PARTIALLY_TESTED"
+          ? "Partial coverage completed"
+          : report.status === "BLOCKED"
+            ? "Policy blocked a specific action"
+            : report.status === "REVIEW_REQUIRED"
+              ? "Review required; evidence preserved"
+              : report.status === "AWAITING_PERMISSION"
+                ? "Waiting for your decision"
+                : report.status === "FAILED"
+              ? "Execution failed; evidence preserved"
+              : videoStatus === "failed"
+                ? "Raw evidence preserved"
+                : videoStatus !== "ready"
+                  ? "Video processing"
+                  : "Execution complete";
+  const complete = !report.incomplete && report.status !== "RUNNING" && report.status !== "PENDING" && report.status !== "AWAITING_PERMISSION";
+  return (
+    <div className="mt-4 flex items-center gap-2 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+      <span className={`h-1.5 w-1.5 rounded-full ${complete ? "bg-success" : "animate-pulse bg-primary"}`} />
+      <span className={complete ? "text-success" : "text-muted-foreground"}>{message}</span>
+      <span className="text-border">·</span>
+      <span>Adaptive browser test</span>
+    </div>
+  );
+}
+
+function V2PlanResults({ plan }: { plan: V2TestPlan }) {
+  const allowed = plan.policyDecisions.filter((decision) => decision.status === "ALLOWED" || decision.status === "APPROVED").length;
+  const blocked = plan.policyDecisions.filter((decision) => decision.status === "BLOCKED" || decision.status === "REJECTED").length;
+  const viewportMatrix = plan.projectMap?.viewportMatrix ?? plan.projectMap?.billingBreakdown?.viewportMatrix ?? [];
+  return (
+    <section className="mt-8 surface-card overflow-hidden">
+      <div className="border-b border-border px-5 py-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="font-mono text-[10px] uppercase tracking-wider text-primary">Test plan</p>
+            <h2 className="mt-1 font-display text-lg font-semibold">{plan.name}</h2>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+            <PlanBadge label={plan.mode.replaceAll("_", " ")} tone="neutral" />
+            <PlanBadge label={plan.status} tone={plan.status === "COMPLETED" ? "success" : "neutral"} />
+          </div>
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          {plan.scenarios.length} planned scenario{plan.scenarios.length === 1 ? "" : "s"} · {allowed} policy decision{allowed === 1 ? "" : "s"} allowed · {blocked} blocked
+        </p>
+      </div>
+      {viewportMatrix.length > 1 && <ViewportOutcomeMatrix plan={plan} />}
+      <div className="grid gap-6 p-5 lg:grid-cols-[1.25fr_1fr]">
+        <div>
+          <h3 className="font-display text-sm font-semibold">Scenario outcomes</h3>
+          <div className="mt-3 divide-y divide-border border-y border-border">
+            {plan.scenarios.map((scenario) => <V2ScenarioRow key={scenario.id} scenario={scenario} />)}
+          </div>
+        </div>
+        <div>
+          <h3 className="font-display text-sm font-semibold">Policy decisions</h3>
+          <div className="mt-3 divide-y divide-border border-y border-border">
+            {plan.policyDecisions.length ? plan.policyDecisions.map((decision) => <V2PolicyRow key={decision.id} decision={decision} />) : (
+              <p className="py-4 text-xs text-muted-foreground">No policy decisions were attached to this plan.</p>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ViewportOutcomeMatrix({ plan }: { plan: V2TestPlan }) {
+  const viewports = plan.projectMap?.viewportMatrix ?? plan.projectMap?.billingBreakdown?.viewportMatrix ?? [];
+  const cases = plan.testCases ?? [];
+  if (viewports.length <= 1) return null;
+  return (
+    <section className="border-y border-border bg-surface-2/20 px-5 py-4" aria-label="Viewport outcomes">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="font-display text-sm font-semibold">Viewport outcomes</h3>
+          <p className="mt-1 text-xs text-muted-foreground">Each approved scenario was evaluated in an isolated browser context. A result is scoped to the viewport where it was observed.</p>
+        </div>
+        <span className="font-mono text-[10px] uppercase tracking-wider text-primary">{viewports.length} conditions</span>
+      </div>
+      <div className="mt-4 grid gap-3 lg:grid-cols-3">
+        {viewports.map((viewport) => {
+          const viewportCases = cases.filter((testCase) => testCase.device === viewport.id);
+          const passed = viewportCases.filter((testCase) => testCase.status === "PASSED").length;
+          return (
+            <div key={viewport.id} className="border border-border bg-background/35 p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div><div className="text-xs font-semibold text-foreground">{viewport.label}</div><div className="mt-1 font-mono text-[10px] text-muted-foreground">{viewport.preset} · {viewport.width}×{viewport.height}</div></div>
+                <span className="font-mono text-[10px] text-muted-foreground">{passed}/{viewportCases.length || plan.scenarios.length} pass</span>
+              </div>
+              <div className="mt-3 divide-y divide-border border-y border-border">
+                {plan.scenarios.map((scenario) => {
+                  const testCase = viewportCases.find((candidate) => candidate.scenarioId === scenario.id);
+                  const outcome = testCase?.status ?? "NEEDS_REVIEW";
+                  return <div key={`${viewport.id}:${scenario.id}`} className="flex items-center justify-between gap-2 py-2"><span className="min-w-0 truncate text-xs text-foreground/80">{scenario.name}</span><OutcomeBadge value={outcome} /></div>;
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function V2ScenarioRow({ scenario }: { scenario: V2Scenario }) {
+  const outcome = scenario.caseStatus ?? scenario.status;
+  return (
+    <div className="py-4">
+      <div className="flex flex-wrap items-start gap-2">
+        <OutcomeBadge value={outcome} />
+        <span className="text-sm font-medium">{scenario.name}</span>
+        <span className="ml-auto font-mono text-[10px] text-muted-foreground">priority {scenario.priority}</span>
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground"><strong className="font-medium text-foreground/80">Intent:</strong> {scenario.intent}</p>
+      <p className="mt-1 text-xs text-muted-foreground"><strong className="font-medium text-foreground/80">Expected:</strong> {scenario.expectedOutcome}</p>
+      <p className="mt-1 text-xs text-muted-foreground"><strong className="font-medium text-foreground/80">Actual:</strong> {describeScenarioResult(scenario.result)}</p>
+    </div>
+  );
+}
+
+function V2PolicyRow({ decision }: { decision: V2PolicyDecision }) {
+  const tone = decision.status === "ALLOWED" || decision.status === "APPROVED" ? "success" : decision.status === "BLOCKED" || decision.status === "REJECTED" ? "danger" : "neutral";
+  return (
+    <div className="py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <PlanBadge label={decision.tier} tone="neutral" />
+        <PlanBadge label={decision.status} tone={tone} />
+        <span className="font-mono text-[10px] text-muted-foreground">{decision.actionKey}</span>
+      </div>
+      {decision.reason && <p className="mt-1 text-xs text-muted-foreground">{decision.reason}</p>}
+    </div>
+  );
+}
+
+function describeScenarioResult(result: unknown) {
+  if (!result || typeof result !== "object") return "No scenario result was returned.";
+  const record = result as Record<string, unknown>;
+  if (typeof record.assertionNarrative === "string" && record.assertionNarrative.trim()) return record.assertionNarrative;
+  if (typeof record.actual === "string" && record.actual.trim()) return record.actual;
+  if (Array.isArray(record.assertions)) {
+    const passed = record.assertions.slice().reverse().find((item) => item && typeof item === "object" && (item as Record<string, unknown>).status === "passed") as Record<string, unknown> | undefined;
+    if (typeof passed?.actual === "string" && passed.actual.trim()) return passed.actual;
+  }
+  if (typeof record.message === "string" && record.message.trim()) return record.message;
+  if (typeof record.url === "string" && record.url.trim()) return `Rendered ${record.url}`;
+  if (Array.isArray(record.viewportResults)) {
+    const results = record.viewportResults.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item))).slice(0, 6);
+    const summarized = results.map((item) => {
+      const viewport = item.viewport && typeof item.viewport === "object" && !Array.isArray(item.viewport) ? item.viewport as Record<string, unknown> : {};
+      const label = typeof viewport.label === "string" ? viewport.label : typeof item.device === "string" ? item.device : "viewport";
+      const status = typeof item.status === "string" ? item.status.replaceAll("_", " ") : "needs review";
+      const nested = item.result && typeof item.result === "object" && !Array.isArray(item.result) ? item.result as Record<string, unknown> : {};
+      const detail = typeof nested.assertionNarrative === "string" ? nested.assertionNarrative : typeof nested.actual === "string" ? nested.actual : "";
+      return `${label}: ${status}${detail ? ` — ${detail}` : ""}`;
+    });
+    if (summarized.length > 0) return summarized.join(" · ");
+  }
+  return "No textual result was recorded for this scenario.";
+}
+
+function OutcomeBadge({ value }: { value: string }) {
+  const tone = value === "PASSED" ? "success" : value === "FAILED" || value === "BLOCKED" ? "danger" : "neutral";
+  return <PlanBadge label={value.replaceAll("_", " ")} tone={tone} />;
+}
+
+function PlanBadge({ label, tone }: { label: string; tone: "success" | "danger" | "neutral" }) {
+  const classes = tone === "success" ? "bg-success/15 text-success" : tone === "danger" ? "bg-destructive/15 text-destructive" : "bg-surface-2 text-muted-foreground";
+  return <span className={`inline-flex items-center rounded-full px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${classes}`}>{label}</span>;
+}
+
+function EvidenceStatus({ report }: { report: RunReport }) {
+  const status = report.artifactStatus?.video?.status ?? "not_available";
+  const videoDisabled = !videoEvidenceEnabled || report.artifactStatus?.video?.reason === "disabled by configuration";
+  const message = !videoEvidenceEnabled
+    ? "Video replay is intentionally disabled for screenshot-first runs."
+    : videoDisabled
+      ? "Video capture is intentionally disabled for screenshot-first runs."
+    : status === "failed"
+      ? "Video evidence could not be prepared for this run."
+      : status === "raw_only"
+        ? "The raw browser recording is available, but the processed replay is not ready."
+        : "No video artifact is available for this run.";
+  return (
+    <div className={`mt-8 flex items-start gap-3 rounded-md border p-4 text-sm ${videoDisabled ? "border-primary/30 bg-primary/5" : "border-warning/40 bg-warning/10"}`}>
+      {videoDisabled ? <Camera className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : <FileWarning className="mt-0.5 h-4 w-4 shrink-0 text-warning" />}
+      <div>
+        <div className="font-medium text-foreground">{videoDisabled ? "Screenshot-first evidence" : "Evidence video unavailable"}</div>
+        <p className="mt-1 text-muted-foreground">{message} The browser run itself is {report.status === "COMPLETED" ? "complete" : report.status.toLowerCase()} and its screenshots, events, assertions, and report remain available.</p>
+      </div>
+    </div>
+  );
+}
+
+function EvidenceVideo({ report, url }: { report: RunReport; url: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const chapters = report.chapters ?? [];
+  const [current, setCurrent] = useState(0);
+  return (
+    <div className="mt-8 surface-card overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border px-5 py-3">
+        <div>
+          <h2 className="font-display text-sm font-semibold">Evidence replay</h2>
+          <p className="font-mono text-[10px] text-muted-foreground">
+            {report.finalVideo ? "cinematic evidence" : "raw browser recording"}
+          </p>
+        </div>
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+        >
+          <ExternalLink className="h-3.5 w-3.5" /> open
+        </a>
+      </div>
+      <div className="bg-black">
+        <video
+          ref={videoRef}
+          src={url}
+          controls
+          playsInline
+          className="mx-auto aspect-video w-full max-h-[680px]"
+          onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+        />
+      </div>
+      {chapters.length > 0 && (
+        <div className="border-t border-border p-3">
+          <div className="mb-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+            Chapters
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {chapters.map((c, i) => (
+              <button
+                key={`${c.title}-${i}`}
+                onClick={() => {
+                  if (videoRef.current) videoRef.current.currentTime = c.startTimestamp / 1000;
+                }}
+                className={`rounded border px-2 py-1 text-[11px] ${current * 1000 >= c.startTimestamp ? "border-primary/40 bg-primary/5" : "border-border hover:bg-accent"}`}
+              >
+                {msToClock(c.startTimestamp)} · {c.title}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatAiValue(value: unknown, depth = 0): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((item) => formatAiValue(item, depth + 1)).filter(Boolean).join("; ");
+  if (depth >= 3) return "[structured value]";
+  return Object.entries(value as Record<string, unknown>)
+    .slice(0, 24)
+    .map(([key, item]) => `${key}: ${formatAiValue(item, depth + 1)}`)
+    .filter((item) => !item.endsWith(": "))
+    .join("; ");
+}
+
+function formatAiList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => formatAiValue(item)).filter(Boolean) : [];
+}
+
+function QuickScanHandoffPanel({ handoff, compact = false }: { handoff?: RunReport["quickScanHandoff"]; compact?: boolean }) {
+  if (!handoff) return null;
+  const findings = Array.isArray(handoff.findings) ? handoff.findings : [];
+  const counts = findings.reduce<Record<string, number>>((result, finding) => {
+    result[finding.status] = (result[finding.status] || 0) + 1;
+    return result;
+  }, {});
+  const statusLabel = (status: string) => status === "CONFIRMED" ? "Confirmed by browser" : status === "NOT_REPRODUCED" ? "Not reproduced" : status === "NOT_TESTED" ? "Not tested" : "Unverified lead";
+  return (
+    <section className={`${compact ? "mt-0" : "mt-6"} surface-card overflow-hidden border border-primary/25`}>
+      <div className="border-b border-border bg-primary/5 px-5 py-4">
+        <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-primary"><Globe className="h-3.5 w-3.5" /> Quick Scan → Real User handoff</div>
+        <h2 className="mt-2 font-display text-lg font-semibold">Structural leads are guiding the browser test</h2>
+        <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">These Quick Scan results are hypotheses, not automatic bugs. The Real User worker can verify, reject, or leave each lead untested using live browser evidence while continuing independent exploration.</p>
+      </div>
+      <div className="grid gap-4 border-b border-border px-5 py-4 sm:grid-cols-4">
+        {[['Total leads', findings.length], ['Confirmed', counts.CONFIRMED || 0], ['Not reproduced', counts.NOT_REPRODUCED || 0], ['Still open', (counts.UNVERIFIED_LEAD || 0) + (counts.NOT_TESTED || 0)]].map(([label, value]) => <div key={String(label)}><p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p><p className="mt-1 text-lg font-semibold text-foreground">{value}</p></div>)}
+      </div>
+      {findings.length > 0 && <div className="divide-y divide-border">{findings.slice(0, compact ? 5 : 20).map((finding) => <div key={finding.id} className="px-5 py-3"><div className="flex flex-wrap items-center gap-2"><PlanBadge label={statusLabel(finding.status)} tone={finding.status === "CONFIRMED" ? "success" : "neutral"} /><span className="text-sm font-medium">{finding.title}</span><span className="font-mono text-[10px] uppercase text-muted-foreground">{finding.category}</span></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{finding.evidence}</p>{finding.verificationNote && <p className="mt-1 text-xs leading-5 text-foreground/75"><span className="font-medium">Browser note:</span> {finding.verificationNote}</p>}</div>)}</div>}
+      {findings.length === 0 && <p className="px-5 py-4 text-sm text-muted-foreground">No structural leads were imported; the Real User worker is exploring independently.</p>}
+    </section>
+  );
+}
+
+function AiOverviewPanel({ report, final = false }: { report: RunReport; final?: boolean }) {
+  const summary = final ? report.aiOverview : report.liveAiSummary;
+  if (!summary) {
+    return (
+      <section className="mt-6 surface-card border border-warning/25 bg-warning/5 p-5">
+        <div className="flex items-center gap-2 text-sm font-medium"><BrainCircuit className="h-4 w-4 text-warning" /> {final ? "Evidence review is still being prepared" : "The test worker is preparing the next update"}</div>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">{final ? "The browser activity, screenshots, and evidence are preserved. Matrix QA will not invent a conclusion before the evidence can be verified." : "The worker is collecting browser evidence and will explain its next step here."}</p>
+      </section>
+    );
+  }
+  const liveSummary = "currentObjective" in summary ? summary : null;
+  const finalSummary = "findings" in summary ? summary : null;
+  const narrative = final
+    ? ("summary" in summary && typeof summary.summary === "string" && summary.summary.trim() ? summary.summary : summary.headline)
+    : ("message" in summary && typeof summary.message === "string" && summary.message.trim() ? summary.message : summary.headline);
+  const blockers = formatAiList(summary.blockers);
+  const findings = finalSummary && Array.isArray(finalSummary.findings) ? finalSummary.findings : [];
+  const live = !final;
+  const liveState = live ? (ACTIVE_RUN_STATUSES.has(report.status) ? "streaming" : "snapshot") : null;
+  return (
+    <section className={`${live ? "mt-4" : "mt-6"} overflow-hidden rounded-xl border ${live ? "border-primary/30 bg-background/25" : "surface-card border-primary/25"}`}>
+      <div className={`border-b ${live ? "border-white/10 bg-background/20 px-3 py-2.5 sm:px-4" : "border-border bg-primary/5 px-5 py-4"}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-primary"><BrainCircuit className="h-3.5 w-3.5" /> {live ? "live-ai" : "Evidence-backed report summary"}</div>
+          {liveState && <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{liveState}</span>}
+        </div>
+        <h2 className={`mt-2 break-words whitespace-pre-wrap ${live ? "font-mono text-[13px] font-medium leading-5 text-foreground sm:text-sm sm:leading-6" : "font-display text-lg font-semibold"}`}>{narrative}</h2>
+        {!final && <div className="mt-2 flex min-w-0 gap-2 border-t border-white/10 pt-2 font-mono text-[11px] leading-5 text-muted-foreground"><span className="shrink-0 text-primary/80">objective$</span><span className="min-w-0 break-words">{liveSummary?.currentObjective}</span></div>}
+      </div>
+      <div className={`grid lg:grid-cols-2 ${live ? "gap-4 p-3 sm:p-4" : "gap-6 p-5"}`}>
+        <div>
+          <h3 className="font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{final ? "What was tested" : "changed"}</h3>
+          <ul className={`mt-2 space-y-1.5 ${live ? "font-mono text-[11px] leading-5 text-foreground/85" : "text-sm text-foreground/85"}`}>{formatAiList(final ? finalSummary?.whatWasTested : liveSummary?.whatChanged).map((item, index) => <li key={index} className="flex gap-2"><span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />{item}</li>)}</ul>
+        </div>
+        <div>
+          <h3 className="font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{final ? "Coverage" : "next"}</h3>
+          <p className={`mt-2 break-words ${live ? "font-mono text-[11px] leading-5 text-foreground/85" : "text-sm leading-6 text-foreground/85"}`}>{final ? formatAiValue(finalSummary?.coverage) || "Coverage summary unavailable." : liveSummary?.nextStep}</p>
+          {blockers.length > 0 && <div className="mt-3"><h4 className="font-mono text-[10px] font-semibold uppercase tracking-wider text-warning">blockers</h4><ul className={`mt-1.5 space-y-1 ${live ? "font-mono text-[11px] leading-5" : "text-xs"} text-muted-foreground`}>{blockers.map((item, index) => <li key={index}>{item}</li>)}</ul></div>}
+        </div>
+      </div>
+      {findings.length > 0 && <div className="border-t border-border px-5 py-4"><h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Findings</h3><div className="mt-3 divide-y divide-border">{findings.map((finding, index) => <div key={index} className="py-3 first:pt-0 last:pb-0"><div className="flex items-center gap-2"><PlanBadge label={finding.severity} tone={finding.severity.toLowerCase().includes("high") || finding.severity.toLowerCase().includes("critical") ? "danger" : "neutral"} /><span className="text-sm font-medium">{finding.title}</span></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{finding.explanation}</p><p className="mt-1 font-mono text-[10px] text-muted-foreground">Evidence: {Array.isArray(finding.evidence) ? finding.evidence.map((evidence) => evidence.label).join(", ") || "none referenced" : "none referenced"}</p></div>)}</div></div>}
+      <div className={`border-t font-mono text-[10px] text-muted-foreground ${live ? "border-white/10 px-3 py-2 sm:px-4" : "border-border px-5 py-3"}`}>Evidence-backed test narrative · generated {new Date(summary.generatedAt).toLocaleTimeString()}</div>
+    </section>
+  );
+}
+
+function presentationModeLabel(mode: ScreenshotPresentationMode): string {
+  if (mode === "BUG_FOCUS_ANNOTATED") return "Bug focus annotated";
+  if (mode === "STANDARD") return "Standard sanitized capture";
+  return "Visual evidence withheld";
+}
+
+function presentationModeDescription(mode: ScreenshotPresentationMode): string {
+  if (mode === "BUG_FOCUS_ANNOTATED") return "The diagnosed area stays clear while unrelated page context is softened.";
+  if (mode === "STANDARD") return "No confirmed visual focus was supplied; the normal sanitized frame is shown.";
+  return "Artifact metadata exists, but Matrix QA did not return a safe image URL.";
+}
+
+function OverviewVisualEvidence({ report }: { report: RunReport }) {
+  const [showStandard, setShowStandard] = useState(false);
+  const presentation = selectOverviewScreenshot(report.screenshots ?? []);
+  const errors = report.errors ?? [];
+  const assertions = report.assertions ?? [];
+  const finding = report.aiOverview?.findings?.[0];
+  const failedAssertion = assertions.find((assertion) => assertion.status === "failed") ?? assertions[0];
+  const firstError = errors[0];
+  const title = finding?.title || failedAssertion?.name || (firstError ? "Run signal needs review" : "Run evidence overview");
+  const summary = finding?.explanation
+    || firstError?.message
+    || (failedAssertion ? `Expected ${formatAiValue(failedAssertion.expected)}; observed ${formatAiValue(failedAssertion.actual)}.` : "The run did not return a finding summary for this evidence package.");
+  const category = finding ? "AI finding" : firstError?.subtype ? firstError.subtype.replaceAll("_", " ") : "Run evidence";
+  const displayMode = showStandard && presentation.sourceUrl ? "STANDARD" as const : presentation.mode;
+  const imageUrl = showStandard && presentation.sourceUrl ? presentation.sourceUrl : presentation.imageUrl;
+  const shot = presentation.screenshot;
+  const hasToggle = presentation.mode === "BUG_FOCUS_ANNOTATED" && Boolean(presentation.sourceUrl);
+  const shotLabel = shot?.label || "Screenshot evidence";
+  const capturedAt = shot ? new Date(shot.t ?? shot.timestamp).toLocaleString() : "not recorded";
+
+  return (
+    <section className="mt-6 overflow-hidden rounded-xl border border-primary/25 bg-surface/70 shadow-[0_18px_60px_rgba(3,8,20,0.22)]" aria-label="Visual evidence overview">
+      <header className="border-b border-border bg-primary/5 px-5 py-4 sm:px-6">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
+              <Camera className="h-3.5 w-3.5" />
+              Primary visual evidence
+            </div>
+            <h2 className="mt-2 break-words font-display text-xl font-semibold tracking-tight text-foreground sm:text-2xl">{title}</h2>
+            <p className="mt-1 text-xs text-muted-foreground">{report.targetUrl || "Target URL not recorded"} · {formatViewportLabel(shot?.viewport)}</p>
+          </div>
+          <span className={`shrink-0 rounded-full border px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider ${displayMode === "BUG_FOCUS_ANNOTATED" ? "border-destructive/35 bg-destructive/10 text-destructive" : displayMode === "STANDARD" ? "border-primary/30 bg-primary/10 text-primary" : "border-warning/35 bg-warning/10 text-warning"}`}>
+            {presentationModeLabel(displayMode)}
+          </span>
+        </div>
+      </header>
+
+      <div className="grid lg:grid-cols-[minmax(16rem,0.72fr)_minmax(0,1.28fr)]">
+        <div className="border-b border-border p-5 sm:p-6 lg:border-b-0 lg:border-r">
+          <h3 className="font-display text-base font-semibold">Summary</h3>
+          <p className="mt-3 text-sm leading-6 text-foreground/85">{summary}</p>
+          <dl className="mt-6 space-y-3 text-sm">
+            <div className="flex items-start justify-between gap-4"><dt className="text-muted-foreground">Status</dt><dd className="text-right font-semibold text-foreground">{report.status.replaceAll("_", " ")}</dd></div>
+            <div className="flex items-start justify-between gap-4"><dt className="text-muted-foreground">Category</dt><dd className="text-right font-semibold capitalize text-foreground">{category}</dd></div>
+            <div className="flex items-start justify-between gap-4"><dt className="text-muted-foreground">Screenshots</dt><dd className="text-right font-semibold text-foreground">{(report.screenshots ?? []).length}</dd></div>
+            <div className="flex items-start justify-between gap-4"><dt className="text-muted-foreground">Captured</dt><dd className="text-right font-mono text-[11px] text-foreground/80">{capturedAt}</dd></div>
+          </dl>
+          <p className="mt-6 border-t border-border pt-4 text-xs leading-5 text-muted-foreground">{presentationModeDescription(displayMode)}</p>
+        </div>
+
+        <div className="min-w-0 p-4 sm:p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="font-display text-base font-semibold">Screenshot</h3>
+              <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{shotLabel}{shot?.redactionStatus ? ` · ${shot.redactionStatus.toLowerCase().replaceAll("_", " ")}` : ""}</p>
+            </div>
+            {hasToggle && (
+              <button type="button" aria-pressed={showStandard} onClick={() => setShowStandard((value) => !value)} className="inline-flex items-center gap-1.5 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px] font-semibold text-primary hover:bg-primary/10">
+                {showStandard ? "Show bug focus" : "Show full sanitized frame"}
+              </button>
+            )}
+          </div>
+          {imageUrl ? (
+            <figure className="mt-4">
+              <div className="overflow-hidden rounded-lg border border-border bg-[#0b1220] p-2 sm:p-3">
+                <img src={imageUrl} alt={displayMode === "BUG_FOCUS_ANNOTATED" ? `${title} — bug-focused screenshot with highlighted defect` : `${title} — sanitized screenshot`} className="max-h-[620px] w-full rounded-md object-contain" />
+              </div>
+              <figcaption className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>{displayMode === "BUG_FOCUS_ANNOTATED" ? "The highlighted region is the visual focus of this finding." : "Sanitized browser capture from the run."}</span>
+                {displayMode === "BUG_FOCUS_ANNOTATED" && shot?.annotationBox && <span className="font-mono text-[10px] text-primary">focus region verified</span>}
+              </figcaption>
+            </figure>
+          ) : (
+            <div className="mt-4 rounded-lg border border-warning/30 bg-warning/5 p-4">
+              <EmptyState icon={Camera} title="Screenshot not available" body={presentationModeDescription("WITHHELD")} compact />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {errors.length > 0 && (
+        <div className="border-t border-border px-5 py-4 sm:px-6">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-display text-base font-semibold">Related console or runtime signals</h3>
+            <span className="font-mono text-[10px] uppercase tracking-wider text-destructive">{errors.length} recorded</span>
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            {errors.slice(0, 4).map((error, index) => <div key={`${error.timestamp}-${index}`} className="flex min-w-0 items-start gap-2 rounded-md border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-foreground/85"><XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" /><span className="min-w-0 break-words">{error.message}</span></div>)}
+          </div>
+          {errors.length > 4 && <p className="mt-2 text-xs text-muted-foreground">Open the Console tab to view all recorded signals.</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function GlobalQuickScanPanel({ report }: { report: RunReport }) {
+  const scan = report.quickScan;
+  if (!scan) return null;
+  const failed = scan.status === "FAILED";
+  return (
+    <section className="mt-6 surface-card overflow-hidden border border-primary/25" aria-label="Quick Scan overview">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border bg-primary/5 px-5 py-4">
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">Step 0 · deterministic Quick Scan</div>
+          <h2 className="mt-2 font-display text-lg font-semibold">Structural checks captured in this run</h2>
+          <p className="mt-1 text-sm leading-5 text-muted-foreground">Measured in the same Playwright page before functional execution. These findings are advisory and never change the functional run status.</p>
+        </div>
+        <span className={`rounded-full border px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider ${failed ? "border-warning/35 bg-warning/10 text-warning" : "border-success/30 bg-success/10 text-success"}`}>{failed ? "unavailable" : `${scan.findingCount} finding${scan.findingCount === 1 ? "" : "s"}`}</span>
+      </div>
+      <div className="px-5 py-4">
+        <p className="text-sm leading-6 text-foreground/85">{scan.summary}</p>
+        {scan.errorMessage && <p className="mt-2 text-xs text-warning">{scan.errorMessage}</p>}
+        {scan.findings.length > 0 && <div className="mt-4 divide-y divide-border rounded-md border border-border"><div className="grid grid-cols-[auto_1fr] gap-3 px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"><span>Category</span><span>Measured finding</span></div>{scan.findings.slice(0, 20).map((finding) => <div key={`${finding.code}-${finding.evidence}`} className="grid grid-cols-[auto_1fr] gap-3 px-3 py-3 text-xs"><span className="font-mono uppercase text-primary">{finding.category}</span><span><strong className="font-medium text-foreground">{finding.title}</strong><span className="mt-1 block leading-5 text-muted-foreground">{finding.evidence}</span></span></div>)}</div>}
+      </div>
+    </section>
+  );
+}
+
+function OverviewTab({ report, issues, onIssue }: { report: RunReport; issues: ReportIssue[]; onIssue: (issue: ReportIssue) => void }) {
+  const errors = report.errors ?? [];
+  const assertions = report.assertions ?? [];
+  return (
+    <div>
+      <QuickScanHandoffPanel handoff={report.quickScanHandoff} />
+      <GlobalQuickScanPanel report={report} />
+      <OverviewVisualEvidence report={report} />
+      <div className="mt-6 grid gap-6 lg:grid-cols-[1.4fr_1fr]">
+      <div className="surface-card overflow-hidden">
+        <div className="border-b border-border px-5 py-3">
+          <h3 className="font-display text-sm font-semibold">Real findings</h3>
+        </div>
+        <div className="divide-y divide-border">
+          {errors.length === 0 ? (
+            <EmptyState
+              icon={CheckCircle2}
+              title="No hard errors captured"
+              body="The backend reported no hard errors for this run."
+              compact
+            />
+          ) : (
+            errors.map((e, i) => {
+              const issue = issues.find((candidate) => candidate.error === e) ?? issues.find((candidate) => candidate.title === e.message);
+              return issue ? <button type="button" key={i} onClick={() => onIssue(issue)} className="block w-full text-left hover:bg-accent/30"><ErrorRow error={e} /></button> : <ErrorRow key={i} error={e} />;
+            })
+          )}
+        </div>
+      </div>
+      <div className="surface-card overflow-hidden">
+        <div className="border-b border-border px-5 py-3">
+          <h3 className="font-display text-sm font-semibold">Execution timeline</h3>
+        </div>
+        <ol className="max-h-[480px] space-y-3 overflow-auto p-5">
+          {(report.events ?? [])
+            .slice()
+            .sort((a, b) => a.timestamp - b.timestamp)
+            .map((e, i) => (
+              <li key={i} className="flex gap-3 text-sm">
+                <span className="w-12 shrink-0 font-mono text-[10px] text-muted-foreground">
+                  {msToClock(e.timestamp)}
+                </span>
+                <span className="text-foreground/80">{eventLabel(e)}</span>
+              </li>
+            ))}
+        </ol>
+      </div>
+      {assertions.length > 0 && (
+        <div className="lg:col-span-2 surface-card overflow-hidden">
+          <div className="border-b border-border px-5 py-3">
+            <h3 className="font-display text-sm font-semibold">Assertions</h3>
+          </div>
+          <div className="grid gap-2 p-4 sm:grid-cols-2">
+            {assertions.map((a, i) => (
+              <div key={i} className="rounded border border-border p-3">
+                <div className="flex items-center gap-2">
+                  {a.status === "passed" ? (
+                    <CheckCircle2 className="h-4 w-4 text-primary" />
+                  ) : (
+                    <XCircle className="h-4 w-4 text-destructive" />
+                  )}
+                  <span className="text-sm">{a.name}</span>
+                  <span className="ml-auto flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
+                    {a.source && <span className={a.source === "AI" ? "text-primary" : "text-warning"}>{a.source === "AI" ? "Test worker" : a.source}</span>}
+                    {msToClock(a.timestamp)}
+                  </span>
+                </div>
+                <p className="mt-2 font-mono text-[10px] text-muted-foreground">
+                  expected: {formatAiValue(a.expected)} · actual: {formatAiValue(a.actual)}
+                </p>
+                {(a.observationId || (a.evidenceRefs?.length ?? 0) > 0) && <p className="mt-1 font-mono text-[10px] text-muted-foreground">{a.observationId ? `observation ${a.observationId}` : ""}{a.evidenceRefs?.length ? `${a.observationId ? " · " : ""}evidence ${a.evidenceRefs.join(", ")}` : ""}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      </div>
+    </div>
+  );
+}
+
+function ScreenshotsTab({
+  report,
+  selected,
+  setSelected,
+}: {
+  report: RunReport;
+  selected: number;
+  setSelected: (n: number) => void;
+}) {
+  const shots = report.screenshots ?? [];
+  const [showBugFocus, setShowBugFocus] = useState(false);
+  if (!shots.length)
+    return (
+      <EmptyState
+        icon={Camera}
+        title="No screenshots captured"
+        body="The backend did not return screenshot artifacts for this run."
+      />
+    );
+  const shot = shots[selected] ?? shots[0];
+  const hasBugFocus = shot.annotationStatus === "APPLIED" && Boolean(shot.annotatedUrl);
+  const shownUrl = showBugFocus && hasBugFocus ? shot.annotatedUrl : shot.url;
+  return (
+    <div className="grid gap-6 lg:grid-cols-[1fr_260px]">
+      <div className="surface-card overflow-hidden">
+        <div className="border-b border-border px-5 py-3">
+          <h3 className="font-display text-sm font-semibold">{shot.label}</h3>
+          <p className="font-mono text-[10px] text-muted-foreground">
+            captured at {msToClock(shot.t ?? shot.timestamp)}
+            {shot.viewport ? ` · ${formatViewportLabel(shot.viewport)}` : ""}
+            {shot.redactionStatus ? ` · ${shot.redactionStatus.toLowerCase().replaceAll("_", " ")}` : ""}
+          </p>
+          {hasBugFocus && (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button type="button" aria-pressed={showBugFocus} onClick={() => setShowBugFocus((value) => !value)} className="rounded-md border border-primary/30 px-2.5 py-1.5 text-[11px] font-semibold text-primary hover:bg-primary/10">
+                {showBugFocus ? "Show normal frame" : "Show bug focus"}
+              </button>
+              <span className="text-[11px] text-muted-foreground">The bug-focus view is an annotated derivative; the normal redacted frame remains the source evidence.</span>
+            </div>
+          )}
+        </div>
+        {shownUrl ? (
+          <img
+            src={shownUrl || undefined}
+            alt={showBugFocus && hasBugFocus ? `${shot.label} — bug focus` : shot.label}
+            className="max-h-[680px] w-full object-contain bg-surface-2"
+          />
+        ) : (
+          <EmptyState
+            icon={Camera}
+            title="Screenshot URL unavailable"
+            body="The backend returned the artifact metadata but no signed URL."
+            compact
+          />
+        )}
+      </div>
+      <div className="surface-card overflow-hidden">
+        <div className="border-b border-border px-4 py-3">
+          <h3 className="font-display text-sm font-semibold">All frames</h3>
+        </div>
+        <ul className="max-h-[560px] overflow-auto p-2">
+          {shots.map((s, i) => (
+            <li key={s.filename}>
+              <button
+                onClick={() => setSelected(i)}
+                className={`flex w-full items-center gap-3 rounded-md border p-2 text-left ${selected === i ? "border-primary/40 bg-primary/5" : "border-transparent hover:bg-accent/40"}`}
+              >
+                <div className="h-12 w-20 shrink-0 overflow-hidden rounded border border-border bg-surface-2">
+                  {s.url && <img src={s.url} alt="" className="h-full w-full object-cover" />}
+                </div>
+                <div className="min-w-0">
+                  <p className="truncate text-xs">{s.label}</p>
+                  <p className="font-mono text-[10px] text-muted-foreground">
+                    {msToClock(s.t ?? s.timestamp)}
+                  </p>
+                  {s.viewport && <p className="text-[10px] text-primary/80">{formatViewportLabel(s.viewport)}</p>}
+                </div>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function ErrorsTab({ errors }: { errors: RunError[] }) {
+  return (
+    <div className="surface-card overflow-hidden">
+      <div className="border-b border-border px-5 py-3">
+        <h3 className="font-display text-sm font-semibold">Hard errors with real timestamps</h3>
+      </div>
+      {errors.length ? (
+        <div className="divide-y divide-border">
+          {errors.map((e, i) => (
+            <ErrorRow key={i} error={e} />
+          ))}
+        </div>
+      ) : (
+        <EmptyState
+          icon={CheckCircle2}
+          title="No hard errors"
+          body="No console, pageerror, or HTTP ≥ 400 hard errors were returned."
+          compact
+        />
+      )}
+    </div>
+  );
+}
+
+const SUCCESSFUL_RUN_STATUSES = new Set(["COMPLETED", "PASSED_WITH_FINDINGS"]);
+const ACTIVE_RUN_STATUSES = new Set(["PENDING", "QUEUED", "RUNNING", "AWAITING_PERMISSION"]);
+
+type ConsoleAction = "PAUSE" | "RESUME" | "APPROVE" | "ALLOW_ACTION" | "ALLOW_SCENARIO" | "SKIP" | "STOP";
+
+type ScopePermissionRequest = {
+  requestId: string;
+  action: string;
+  target: string;
+  route: string;
+  risk: string;
+  reason: string;
+  expectedEffect: string;
+  observedControl?: Record<string, unknown>;
+};
+
+function scopePermissionFromMessage(message: RunMessage): ScopePermissionRequest | null {
+  const metadata = message.metadata;
+  if (!metadata || metadata.type !== "ai-agent-scope-permission-requested") return null;
+  const requestId = typeof metadata.requestId === "string" ? metadata.requestId : "";
+  if (!requestId) return null;
+  return {
+    requestId,
+    action: typeof metadata.action === "string" ? metadata.action : "browser action",
+    target: typeof metadata.target === "string" ? metadata.target : "observed control",
+    route: typeof metadata.route === "string" ? metadata.route : "/",
+    risk: typeof metadata.risk === "string" ? metadata.risk : "UNKNOWN",
+    reason: typeof metadata.reason === "string" ? metadata.reason : "This action is outside the current run scope.",
+    expectedEffect: typeof metadata.expectedEffect === "string" ? metadata.expectedEffect : "The action may change the current browser state.",
+    observedControl: metadata.observedControl && typeof metadata.observedControl === "object" ? metadata.observedControl as Record<string, unknown> : undefined,
+  };
+}
+
+type QaMarkdownBlock =
+  | { type: "heading"; level: 1 | 2 | 3; text: string }
+  | { type: "paragraph"; text: string }
+  | { type: "list"; ordered: boolean; items: string[] }
+  | { type: "table"; headers: string[]; rows: string[][] }
+  | { type: "code"; text: string };
+
+function splitQaTableRow(line: string): string[] {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function parseQaMarkdown(markdown: string): QaMarkdownBlock[] {
+  const lines = markdown.replace(/\r/g, "").split("\n");
+  const blocks: QaMarkdownBlock[] = [];
+  let paragraph: string[] = [];
+  let code: string[] | null = null;
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      blocks.push({ type: "paragraph", text: paragraph.join(" ").trim() });
+      paragraph = [];
+    }
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (code) {
+      if (/^```/.test(line.trim())) {
+        blocks.push({ type: "code", text: code.join("\n") });
+        code = null;
+      } else {
+        code.push(line);
+      }
+      continue;
+    }
+    if (/^```/.test(line.trim())) {
+      flushParagraph();
+      code = [];
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.+?)\s*$/);
+    if (heading) {
+      flushParagraph();
+      blocks.push({ type: "heading", level: heading[1].length as 1 | 2 | 3, text: heading[2] });
+      continue;
+    }
+    const nextLine = lines[index + 1] ?? "";
+    if (/^\s*\|/.test(line) && /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(nextLine)) {
+      flushParagraph();
+      const headers = splitQaTableRow(line);
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length && /^\s*\|/.test(lines[index] ?? "")) {
+        rows.push(splitQaTableRow(lines[index] ?? ""));
+        index += 1;
+      }
+      index -= 1;
+      blocks.push({ type: "table", headers, rows });
+      continue;
+    }
+    const listMatch = line.match(/^\s*([-*]|\d+[.)])\s+(.+)$/);
+    if (listMatch) {
+      flushParagraph();
+      const ordered = /\d/.test(listMatch[1]);
+      const items = [listMatch[2]];
+      while (index + 1 < lines.length) {
+        const nextList = (lines[index + 1] ?? "").match(/^\s*([-*]|\d+[.)])\s+(.+)$/);
+        if (!nextList || /\d/.test(nextList[1]) !== ordered) break;
+        items.push(nextList[2]);
+        index += 1;
+      }
+      blocks.push({ type: "list", ordered, items });
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      continue;
+    }
+    paragraph.push(line.trim());
+  }
+  if (code) blocks.push({ type: "code", text: code.join("\n") });
+  flushParagraph();
+  return blocks.filter((block) => block.type !== "paragraph" || block.text.length > 0);
+}
+
+function renderQaInline(value: string, keyPrefix: string): ReactNode[] {
+  const parts = value.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={`${keyPrefix}-strong-${index}`} className="font-semibold text-foreground">{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return <code key={`${keyPrefix}-code-${index}`} className="rounded bg-black/25 px-1 py-0.5 font-mono text-[0.92em] text-primary">{part.slice(1, -1)}</code>;
+    }
+    return <span key={`${keyPrefix}-text-${index}`}>{part}</span>;
+  });
+}
+
+function SafeQaMarkdown({ markdown }: { markdown: string }) {
+  const blocks = parseQaMarkdown(markdown);
+  return (
+    <div className="space-y-3 text-[12px] leading-5 text-foreground/85 sm:text-[13px] sm:leading-5">
+      {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          const className = block.level === 1
+            ? "font-display text-sm font-semibold text-foreground"
+            : "font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-primary";
+          return <div key={`qa-heading-${index}`} role={block.level === 1 ? "heading" : undefined} aria-level={block.level === 1 ? 2 : undefined} className={className}>{renderQaInline(block.text, `qa-heading-${index}`)}</div>;
+        }
+        if (block.type === "list") {
+          const ListTag = block.ordered ? "ol" : "ul";
+          return <ListTag key={`qa-list-${index}`} className={`${block.ordered ? "list-decimal" : "list-disc"} space-y-1 pl-5 marker:text-primary`}>{block.items.map((item, itemIndex) => <li key={`qa-item-${index}-${itemIndex}`}>{renderQaInline(item, `qa-item-${index}-${itemIndex}`)}</li>)}</ListTag>;
+        }
+        if (block.type === "table") {
+          return (
+            <div key={`qa-table-${index}`} className="overflow-x-auto rounded-md border border-white/10 bg-black/10" role="table" aria-label="QA activity timeline">
+              <div className="min-w-[560px] divide-y divide-white/10 font-mono text-[10px] leading-4">
+                <div className="grid grid-cols-[76px_1.2fr_1.6fr_1fr_1fr] gap-2 bg-white/[0.04] px-2.5 py-1.5 text-primary" role="row">
+                  {block.headers.map((header, headerIndex) => <span key={`qa-header-${index}-${headerIndex}`} role="columnheader">{renderQaInline(header, `qa-header-${index}-${headerIndex}`)}</span>)}
+                </div>
+                {block.rows.map((row, rowIndex) => <div key={`qa-row-${index}-${rowIndex}`} className="grid grid-cols-[76px_1.2fr_1.6fr_1fr_1fr] gap-2 px-2.5 py-1.5 text-muted-foreground" role="row">{block.headers.map((_, cellIndex) => <span key={`qa-cell-${index}-${rowIndex}-${cellIndex}`} role="cell">{renderQaInline(row[cellIndex] ?? "—", `qa-cell-${index}-${rowIndex}-${cellIndex}`)}</span>)}</div>)}
+              </div>
+            </div>
+          );
+        }
+        if (block.type === "code") return <pre key={`qa-code-${index}`} className="overflow-x-auto rounded-md border border-white/10 bg-black/25 px-2.5 py-2 font-mono text-[10px] leading-4 text-foreground/80">{block.text}</pre>;
+        return <p key={`qa-paragraph-${index}`} className="break-words">{renderQaInline(block.text, `qa-paragraph-${index}`)}</p>;
+      })}
+    </div>
+  );
+}
+
+function QaActivityPanel({ state }: { state: QaLiveState | null }) {
+  if (!state) return null;
+  const healthy = state.persistence.health === "healthy";
+  const viewport = state.run.currentViewport;
+  const viewportText = formatViewportLabel(viewport);
+  const viewportMatrix = state.run.viewportMatrix ?? [];
+  const viewportMatrixText = viewportMatrix.length > 1 ? viewportMatrix.map((item) => `${item.label} (${item.width}×${item.height})`).join(" · ") : null;
+  const syncedText = state.persistence.lastSyncedAt ? new Date(state.persistence.lastSyncedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "pending";
+  return (
+    <section className="border-b border-white/10 bg-black/10 px-3 py-3 backdrop-blur-md sm:px-4" aria-label="QA Activity and Agent Notes" aria-live="polite">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-primary"><Terminal className="h-3.5 w-3.5 shrink-0" /><h3 className="truncate">agent-notes</h3><span className="text-muted-foreground">·</span><span className="text-muted-foreground">durable projection</span></div>
+          <p className="mt-1 max-w-2xl text-[11px] leading-4 text-muted-foreground">Readable state-summary generated from the durable event ledger. The note is a projection; the event history remains canonical.</p>
+        </div>
+        <div className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[10px] uppercase tracking-wider ${healthy ? "border-primary/25 bg-primary/10 text-primary" : "border-warning/30 bg-warning/10 text-warning"}`}><span className={`h-1.5 w-1.5 rounded-full ${healthy ? "bg-primary" : "bg-warning"}`} />{healthy ? "persistence healthy" : "sync degraded"}</div>
+      </div>
+      <div className="mt-3 grid gap-1.5 font-mono text-[10px] leading-4 text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
+        <div className="flex min-w-0 gap-2"><span className="shrink-0 text-primary/80">phase$</span><span className="truncate text-foreground/80">{state.run.currentPhase || "not recorded"}</span></div>
+        <div className="flex min-w-0 gap-2"><span className="shrink-0 text-primary/80">route$</span><span className="truncate text-foreground/80">{state.run.currentRoute || state.run.targetUrl}</span></div>
+        <div className="flex min-w-0 gap-2"><span className="shrink-0 text-primary/80">viewport$</span><span className="min-w-0 text-foreground/80"><span>{viewportText}{viewportMatrix.length > 1 ? ` · ${viewportMatrix.length} contexts` : ""}</span>{viewportMatrixText && <span className="mt-0.5 block truncate text-[9px] text-muted-foreground" title={viewportMatrixText}>{viewportMatrixText}</span>}</span></div>
+        <div className="flex min-w-0 gap-2"><span className="shrink-0 text-primary/80">sync$</span><span className="text-foreground/80">seq {state.persistence.latestSyncedSequence}/{state.persistence.latestEventSequence} · {syncedText}{state.persistence.backlog ? ` · ${state.persistence.backlog} pending` : ""}</span></div>
+      </div>
+      <div className="mt-3 max-h-[420px] overflow-auto rounded-md border border-white/10 bg-background/15 px-3 py-3 sm:max-h-[500px]">
+        <SafeQaMarkdown markdown={state.note.markdown} />
+      </div>
+    </section>
+  );
+}
+
+function RunConsoleTab({ projectId, runId, report }: { projectId: string; runId: string; report: RunReport }) {
+  const [messages, setMessages] = useState<RunMessage[]>([]);
+  const [draft, setDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [activeAction, setActiveAction] = useState<ConsoleAction | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [qaState, setQaState] = useState<QaLiveState | null>(null);
+  const [continuing, setContinuing] = useState(false);
+  const pendingScopeRequest = useMemo(() => {
+    let pending: ScopePermissionRequest | null = null;
+    let resolvedRequestId: string | null = null;
+    for (const message of messages) {
+      const request = scopePermissionFromMessage(message);
+      if (request) { pending = request; resolvedRequestId = null; }
+      const metadata = message.metadata;
+      if (metadata?.type === "ai-agent-scope-permission-resolved" && typeof metadata.requestId === "string") {
+        if (pending?.requestId === metadata.requestId) resolvedRequestId = metadata.requestId;
+      }
+    }
+    return pending && pending.requestId !== resolvedRequestId ? pending : null;
+  }, [messages]);
+  const [expired, setExpired] = useState(false);
+  const active = ACTIVE_RUN_STATUSES.has(report.status);
+  const successful = SUCCESSFUL_RUN_STATUSES.has(report.status);
+  const finishedAt = report.finishedAt ? new Date(report.finishedAt).getTime() : null;
+  const pastRetention = successful && finishedAt != null && finishedAt + 60_000 <= Date.now();
+
+  const loadMessages = async () => {
+    try {
+      const next = normalizeRunMessages(await runsApi.listMessages(projectId, runId));
+      setMessages(next);
+      setExpired(successful && pastRetention && next.length === 0);
+      setError(null);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Unable to load the Run Console.";
+      if (successful && (/expired|not found|transcript/i.test(message))) setExpired(true);
+      else setError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadQaState = async () => {
+    try {
+      const next = await runsApi.getQaState(projectId, runId);
+      setQaState(next);
+    } catch {
+      // The legacy execution-state stream remains the fallback if the projection is unavailable.
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (cancelled) return;
+      await loadMessages();
+      await loadQaState();
+    };
+    void load();
+    if (!active) return () => { cancelled = true; };
+    const interval = window.setInterval(() => { void load(); }, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [projectId, runId, active, report.status, report.finishedAt]);
+
+  const submitMessage = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const body = draft.trim();
+    if (!body || sending || expired) return;
+    setSending(true);
+    setError(null);
+    try {
+      const created = normalizeRunMessages([await runsApi.addMessage(projectId, runId, body)])[0];
+      if (created) setMessages((current) => [...current.filter((message) => message.id !== created.id), created]);
+      setDraft("");
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Unable to send your message.";
+      if (/expired|transcript/i.test(message)) setExpired(true);
+      else setError(message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const continueWithAi = async () => {
+    if (continuing || expired || !report.v2Plan) return;
+    setContinuing(true);
+    setError(null);
+    try {
+      const next = await runsApi.continue(projectId, runId, draft.trim() || undefined);
+      window.location.href = `/app/runs/${encodeURIComponent(next.id)}?projectId=${encodeURIComponent(projectId)}`;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to continue this run.");
+      setContinuing(false);
+    }
+  };
+
+  const sendControl = async (action: ConsoleAction, metadata?: Record<string, unknown>) => {
+    if (activeAction || expired) return;
+    if (action === "STOP" && !window.confirm("Stop this run? The worker will preserve the evidence collected so far.")) return;
+    setActiveAction(action);
+    setError(null);
+    try {
+      const result = await runsApi.control(projectId, runId, action, undefined, metadata);
+      const controlMessage = result.message ? normalizeRunMessages([result.message])[0] : null;
+      if (controlMessage) setMessages((current) => [...current.filter((message) => message.id !== controlMessage.id), controlMessage]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Unable to request ${action.toLowerCase()}.`);
+    } finally {
+      setActiveAction(null);
+      void loadMessages();
+    }
+  };
+
+  return (
+    <section className="overflow-hidden rounded-xl border border-white/15 bg-surface/55 shadow-[0_24px_80px_-32px_rgba(0,0,0,0.9),0_0_0_1px_rgba(140,255,160,0.05)] backdrop-blur-2xl">
+      <div className="border-b border-white/10 bg-background/20 px-3 py-2.5 backdrop-blur-md sm:px-4 sm:py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2 font-mono text-[11px] uppercase tracking-wider">
+            <Terminal className="h-3.5 w-3.5 shrink-0 text-primary" />
+            <h3 className="truncate font-semibold text-foreground">run-console</h3>
+            <span className="text-muted-foreground">·</span>
+            <span className={active ? "inline-flex items-center gap-1 text-primary" : "text-muted-foreground"}>{active && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />}{active ? "streaming" : successful ? "complete" : report.status.toLowerCase()}</span>
+          </div>
+          <button type="button" onClick={() => void loadMessages()} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-white/15 bg-white/[0.04] px-2 py-1 font-mono text-[10px] text-muted-foreground backdrop-blur-md hover:border-primary/35 hover:bg-primary/10 hover:text-foreground" aria-label="Refresh console">
+            <RefreshCw className="h-3 w-3" /> refresh
+          </button>
+        </div>
+        <div className="mt-2 flex min-w-0 items-center gap-1.5 overflow-hidden rounded-md border border-white/10 bg-black/20 px-2.5 py-1.5 font-mono text-[10px] leading-4">
+          <span className="shrink-0 text-primary">matrixqa</span><span className="shrink-0 text-muted-foreground">@</span><span className="truncate text-foreground/80">run:{runId.slice(0, 8)}</span><span className="shrink-0 text-primary">$</span><span className="truncate text-muted-foreground">tail --follow transcript</span>
+        </div>
+        <p className="mt-1.5 font-mono text-[10px] leading-4 text-muted-foreground">{active ? "live event stream · type a bounded instruction below" : "read-only transcript · report evidence remains available"}</p>
+      </div>
+
+      {error && <div className="border-b border-destructive/30 bg-destructive/10 px-5 py-3 text-xs text-destructive">{error}</div>}
+      {expired ? (
+        <div className="px-5 py-12 text-center">
+          <ShieldCheck className="mx-auto h-7 w-7 text-muted-foreground" />
+          <h4 className="mt-3 text-sm font-medium">Transcript expired</h4>
+          <p className="mx-auto mt-1 max-w-md text-xs text-muted-foreground">Successful run transcripts are automatically deleted one minute after completion. The report, screenshots, and findings remain available.</p>
+        </div>
+      ) : (
+        <>
+          {(!active && !successful && !expired && report.v2Plan && (report.status === "BLOCKED" || report.status === "FAILED" || report.status === "PARTIALLY_TESTED" || report.status === "REVIEW_REQUIRED")) && (
+            <div className="border-b border-primary/30 bg-primary/5 px-5 py-4" role="region" aria-label="Continue test run">
+              <div className="flex items-start gap-3">
+                <BrainCircuit className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
+                <div className="min-w-0 flex-1">
+                  <p className="font-display text-sm font-semibold text-foreground">The test worker needs another instruction</p>
+                  <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">This run is closed, so the live worker cannot receive a message. Start a fresh continuation from the same test plan and tell the worker what to retry, inspect, or adapt. The original result remains unchanged for audit history.</p>
+                    <textarea id="run-continuation-instruction" value={draft} onChange={(event) => setDraft(event.target.value)} disabled={continuing} rows={3} maxLength={4000} placeholder="Example: Re-open the Platform link, inspect the actual page heading, and adapt the assertion to the content you observe." className="mt-3 w-full resize-y rounded-xl border border-white/15 bg-white/[0.04] px-3 py-2 text-sm outline-none backdrop-blur-md placeholder:text-muted-foreground focus:border-primary disabled:opacity-60" />
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button type="button" onClick={() => void continueWithAi()} disabled={continuing} className="inline-flex items-center gap-1.5 rounded-xl border border-primary/35 bg-primary/75 px-3 py-2 text-xs font-semibold text-primary-foreground backdrop-blur-md disabled:cursor-not-allowed disabled:opacity-50">{continuing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Continue test</button>
+                    <span className="text-[11px] text-muted-foreground">A new run will be created from the same approved test plan.</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          <QuickScanHandoffPanel handoff={report.quickScanHandoff} compact />
+          <QaActivityPanel state={qaState} />
+          <AiOverviewPanel report={report} />
+          {pendingScopeRequest && active && (
+            <div className="border-b border-warning/40 bg-warning/10 px-5 py-4" role="alert" aria-live="assertive">
+              <div className="flex items-start gap-3">
+                <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-warning" />
+                <div className="min-w-0 flex-1">
+                  <p className="font-display text-sm font-semibold text-foreground">The test worker wants to test something outside this run’s scope</p>
+                  <p className="mt-1 text-sm leading-6 text-foreground/85">Target: <strong>{pendingScopeRequest.target}</strong></p>
+                  <dl className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
+                    <div><dt className="font-mono uppercase tracking-wider">Why</dt><dd className="mt-0.5 text-foreground/75">{pendingScopeRequest.reason}</dd></div>
+                    <div><dt className="font-mono uppercase tracking-wider">Expected effect</dt><dd className="mt-0.5 text-foreground/75">{pendingScopeRequest.expectedEffect}</dd></div>
+                    <div><dt className="font-mono uppercase tracking-wider">Current route</dt><dd className="mt-0.5 font-mono text-foreground/75">{pendingScopeRequest.route}</dd></div>
+                    <div><dt className="font-mono uppercase tracking-wider">Risk classification</dt><dd className="mt-0.5 text-foreground/75">{pendingScopeRequest.risk}</dd></div>
+                  </dl>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button type="button" disabled={Boolean(activeAction)} onClick={() => void sendControl("ALLOW_ACTION", { requestId: pendingScopeRequest.requestId })} className="inline-flex items-center gap-1.5 rounded-xl border border-primary/35 bg-primary/75 px-3 py-2 text-xs font-semibold text-primary-foreground backdrop-blur-md disabled:opacity-50"><Check className="h-3.5 w-3.5" /> Allow this action</button>
+                    <button type="button" disabled={Boolean(activeAction)} onClick={() => void sendControl("ALLOW_SCENARIO", { requestId: pendingScopeRequest.requestId })} className="inline-flex items-center gap-1.5 rounded-xl border border-primary/40 bg-white/[0.04] px-3 py-2 text-xs font-semibold text-primary backdrop-blur-md hover:bg-primary/10 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Allow this scenario</button>
+                    <button type="button" disabled={Boolean(activeAction)} onClick={() => void sendControl("SKIP", { requestId: pendingScopeRequest.requestId })} className="inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/[0.04] px-3 py-2 text-xs text-muted-foreground backdrop-blur-md hover:border-primary/30 hover:bg-primary/10 disabled:opacity-50"><SkipForward className="h-3.5 w-3.5" /> Continue without it</button>
+                    <button type="button" disabled={Boolean(activeAction)} onClick={() => void sendControl("STOP", { requestId: pendingScopeRequest.requestId })} className="inline-flex items-center gap-1.5 rounded-xl border border-destructive/40 bg-destructive/[0.06] px-3 py-2 text-xs text-destructive backdrop-blur-md hover:bg-destructive/10 disabled:opacity-50"><Square className="h-3.5 w-3.5" /> Stop run</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="max-h-[min(520px,52vh)] space-y-0 overflow-auto bg-background/20 px-3 py-2 backdrop-blur-sm sm:px-4 sm:py-3">
+            {loading && !messages.length ? (
+              <div className="flex items-center gap-2 py-8 font-mono text-[11px] text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin text-primary" /> tailing worker transcript…</div>
+            ) : messages.length ? messages.map((message) => <RunConsoleMessage key={message.id} message={message} />) : (
+              <div className="flex items-center gap-2 py-8 font-mono text-[11px] text-muted-foreground"><span className="text-primary">$</span> no output yet · worker updates will appear here</div>
+            )}
+          </div>
+          <div className="border-t border-white/10 bg-background/15 px-3 py-3 backdrop-blur-md sm:px-4">
+            <div className="flex flex-wrap gap-2">
+              <ConsoleButton action="PAUSE" icon={Pause} disabled={!active || Boolean(activeAction)} pending={activeAction === "PAUSE"} onClick={sendControl} />
+              <ConsoleButton action="RESUME" icon={Play} disabled={!active || Boolean(activeAction)} pending={activeAction === "RESUME"} onClick={sendControl} />
+              <ConsoleButton action="APPROVE" icon={ShieldCheck} disabled={!active || Boolean(activeAction)} pending={activeAction === "APPROVE"} onClick={sendControl} />
+              <ConsoleButton action="SKIP" icon={SkipForward} disabled={!active || Boolean(activeAction)} pending={activeAction === "SKIP"} onClick={sendControl} />
+              <ConsoleButton action="STOP" icon={Square} disabled={!active || Boolean(activeAction)} pending={activeAction === "STOP"} onClick={sendControl} danger />
+            </div>
+            <form onSubmit={submitMessage} className="mt-3 flex gap-2">
+              <label className="sr-only" htmlFor="run-console-message">Message the Run Console</label>
+              <span className="flex items-center font-mono text-xs text-primary" aria-hidden="true">$</span>
+              <input id="run-console-message" value={draft} onChange={(event) => setDraft(event.target.value)} disabled={!active || sending} maxLength={4000} placeholder={active ? "tell the worker what to inspect next…" : "console input is available while the run is active"} className="min-w-0 flex-1 rounded-md border border-white/15 bg-black/20 px-2.5 py-2 font-mono text-[12px] outline-none placeholder:text-muted-foreground focus:border-primary" />
+              <button type="submit" disabled={!active || !draft.trim() || sending || expired} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-primary/35 bg-primary/75 px-2.5 py-2 font-mono text-[11px] text-primary-foreground backdrop-blur-md disabled:cursor-not-allowed disabled:opacity-50"><Send className="h-3 w-3" /> send</button>
+            </form>
+            <p className="mt-2 font-mono text-[10px] leading-4 text-muted-foreground">stdin is added to the next test-worker decision · stop preserves evidence · dangerous actions remain fail-closed</p>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function ConsoleButton({ action, icon: Icon, disabled, pending, onClick, danger = false }: { action: ConsoleAction; icon: typeof Pause; disabled: boolean; pending: boolean; onClick: (action: ConsoleAction) => void; danger?: boolean }) {
+  return <button type="button" disabled={disabled} onClick={() => onClick(action)} className={`inline-flex shrink-0 items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wide backdrop-blur-md disabled:cursor-not-allowed disabled:opacity-45 ${danger ? "border-destructive/40 bg-destructive/[0.06] text-destructive hover:bg-destructive/10" : "border-white/15 bg-white/[0.04] text-muted-foreground hover:border-primary/30 hover:bg-primary/10 hover:text-foreground"}`}>
+    {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Icon className="h-3.5 w-3.5" />} {action}
+  </button>;
+}
+
+function RunConsoleMessage({ message }: { message: RunMessage }) {
+  const user = message.authorType === "USER";
+  const summary = message.kind === "SUMMARY";
+  const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : null;
+  const rawSummary = metadata && "summary" in metadata && typeof metadata.summary === "object" && metadata.summary ? metadata.summary as Record<string, unknown> : null;
+  const evidence = rawSummary && Array.isArray(rawSummary.evidenceRefs) ? rawSummary.evidenceRefs : [];
+  const authorLabel = user ? "you" : message.authorType === "SYSTEM" ? "system" : "agent";
+  const messageLabel = summary ? "summary" : message.kind === "APPROVAL" ? "permission" : message.kind === "CONTROL" ? "control" : message.kind === "STATUS" ? "status" : "output";
+  const safeObjective = rawSummary && typeof rawSummary.currentObjective === "string" ? rawSummary.currentObjective : null;
+  const safeNextStep = rawSummary && typeof rawSummary.nextStep === "string" ? rawSummary.nextStep : null;
+  const prompt = user ? ">" : message.authorType === "SYSTEM" ? "!" : "✓";
+  const tone = summary ? "border-primary/35 bg-primary/10" : user ? "border-primary/25 bg-primary/[0.08]" : "border-white/10 bg-black/10";
+  return <article className="border-b border-white/[0.07] py-2.5 last:border-b-0 sm:py-3">
+    <div className="flex min-w-0 items-start gap-2.5">
+      <span className={`mt-0.5 w-3 shrink-0 text-center font-mono text-xs ${user || summary ? "text-primary" : message.authorType === "SYSTEM" ? "text-warning" : "text-success"}`} aria-hidden="true">{prompt}</span>
+      <div className={`min-w-0 flex-1 rounded-md border px-2.5 py-2 ${tone}`}>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+          <span className={user || summary ? "text-primary" : "text-foreground/70"}>{authorLabel}</span>
+          <span className="text-border">·</span>
+          <span>{messageLabel}</span>
+          <time className="ml-auto" dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
+        </div>
+        <p className="mt-1.5 break-words whitespace-pre-wrap font-mono text-[12px] leading-5 text-foreground/90 sm:text-[13px] sm:leading-5">{message.body}</p>
+        {safeObjective && <div className="mt-2 flex min-w-0 gap-2 font-mono text-[10px] leading-4 text-muted-foreground"><span className="shrink-0 text-primary/80">objective$</span><span className="min-w-0 break-words">{safeObjective}</span></div>}
+        {safeNextStep && <div className="mt-1.5 flex min-w-0 gap-2 font-mono text-[10px] leading-4 text-muted-foreground"><span className="shrink-0 text-primary/80">next$</span><span className="min-w-0 break-words">{safeNextStep}</span></div>}
+        {evidence.length > 0 && <div className="mt-2 break-words font-mono text-[9px] leading-4 text-muted-foreground"><span className="text-primary/80">evidence$</span> {evidence.map((item) => typeof item === "object" && item && "label" in item ? String(item.label) : String(item)).join(", ")}</div>}
+      </div>
+    </div>
+  </article>;
+}
+
+function EventsTab({ report }: { report: RunReport }) {
+  const events = report.events ?? [];
+  return (
+    <div className="surface-card overflow-hidden">
+      <div className="border-b border-border px-5 py-3">
+        <h3 className="font-display text-sm font-semibold">Execution & browser events</h3>
+        <p className="mt-1 text-xs text-muted-foreground">Lifecycle events from the worker are shown alongside browser evidence events.</p>
+      </div>
+      <div className="max-h-[620px] overflow-auto">
+        {events.map((e, i) => (
+          <div
+            key={i}
+            className="grid gap-2 border-b border-border px-5 py-3 md:grid-cols-[80px_130px_1fr]"
+          >
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {msToClock(e.timestamp)}
+            </span>
+              <span className="font-mono text-[11px] text-primary">{eventTypeLabel(e.type)}</span>
+            <span className="text-sm">
+              {eventLabel(e)}
+              {e.x != null && e.y != null && (
+                <span className="ml-2 font-mono text-[10px] text-muted-foreground">
+                  ({Math.round(e.x)}, {Math.round(e.y)})
+                </span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AssertionsTab({ report }: { report: RunReport }) {
+  const assertions = report.assertions ?? [];
+  return (
+    <div className="surface-card overflow-hidden">
+      <div className="border-b border-border px-5 py-3">
+        <h3 className="font-display text-sm font-semibold">Real assertions</h3>
+      </div>
+      {assertions.length ? (
+        <div className="divide-y divide-border">
+          {assertions.map((a, i) => (
+            <div key={i} className="px-5 py-4">
+              <div className="flex items-center gap-2">
+                {a.status === "passed" ? (
+                  <CheckCircle2 className="h-4 w-4 text-primary" />
+                ) : (
+                  <XCircle className="h-4 w-4 text-destructive" />
+                )}
+                <span>{a.name}</span>
+                <span className="ml-auto font-mono text-[10px] text-muted-foreground">
+                  {msToClock(a.timestamp)}
+                </span>
+              </div>
+              <div className="mt-2 grid gap-2 text-xs md:grid-cols-2">
+                <div className="rounded bg-surface-2 p-2">
+                  <span className="text-muted-foreground">Expected</span>
+                  <div className="mt-1 font-mono">{String(a.expected)}</div>
+                </div>
+                <div className="rounded bg-surface-2 p-2">
+                  <span className="text-muted-foreground">Actual</span>
+                  <div className="mt-1 font-mono">{String(a.actual)}</div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <EmptyState
+          icon={FileWarning}
+          title="No assertions returned"
+          body="The backend has not attached assertions to this run."
+          compact
+        />
+      )}
+    </div>
+  );
+}
+
+function ErrorRow({ error }: { error: RunError }) {
+  return (
+    <div className="flex items-start gap-3 px-5 py-4">
+      <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap gap-2 font-mono text-[10px] text-muted-foreground">
+          <span>{msToClock(error.timestamp)}</span>
+          <span>·</span>
+          <span>{error.subtype}</span>
+          {error.status != null && (
+            <>
+              <span>·</span>
+              <span>HTTP {error.status}</span>
+            </>
+          )}
+        </div>
+        <p className="mt-1 break-words text-sm">{error.message}</p>
+        {error.target && (
+          <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+            target: {error.target}
+            {error.x != null && error.y != null
+              ? ` · (${Math.round(error.x)}, ${Math.round(error.y)})`
+              : ""}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DetailStatusPill({ status }: { status: string }) {
+  const normalized = status.toUpperCase();
+  const tone =
+    normalized === "COMPLETED"
+      ? "bg-success/15 text-success"
+      : normalized === "PASSED_WITH_FINDINGS" || normalized === "PARTIALLY_TESTED" || normalized === "BLOCKED"
+        ? "bg-warning/15 text-warning"
+        : normalized === "FAILED"
+          ? "bg-destructive/15 text-destructive"
+          : normalized === "RUNNING"
+            ? "bg-primary/15 text-primary"
+            : "bg-surface-2 text-muted-foreground";
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${tone}`}
+    >
+      {(normalized === "RUNNING" || normalized === "PENDING") && (
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${normalized === "RUNNING" ? "animate-pulse bg-primary" : "bg-muted-foreground"}`}
+        />
+      )}
+      {normalized}
+    </span>
+  );
+}
+function buildReportMarkdown(report: RunReport, runId: string) {
+  const id = report.id ?? report.runId ?? runId;
+  const summary = reportSummary(report);
+  const ai = report.aiOverview;
+  const lines = [
+    `# Matrix QA run ${id}`,
+    "",
+    `- Status: ${report.status}`,
+    `- Target URL: ${report.targetUrl ?? "—"}`,
+    `- Test strategy: Adaptive browser test`,
+    `- Started: ${report.startedAt ? new Date(report.startedAt).toISOString() : "—"}`,
+    `- Duration: ${duration(report.durationSec)}`,
+    `- Scenarios: ${summary.passed}/${summary.scenarios} passed`,
+    `- Bugs captured: ${summary.bugs}`,
+    `- Screenshots: ${(report.screenshots ?? []).length}`,
+    `- Events: ${(report.events ?? []).length}`,
+    `- Evidence video: ${!videoEvidenceEnabled ? "disabled for screenshot-first mode; screenshots retained" : report.artifactStatus?.video?.status === "ready" ? "processed video available" : report.artifactStatus?.video?.status === "raw_only" ? "raw recording available; processed video unavailable" : "not available"}`,
+  ];
+
+  if (ai) {
+    lines.push("", "## Test summary", "", `> ${ai.summary || ai.headline}`, "", `**Coverage:** ${String(ai.coverage)}`);
+    if (ai.findings.length > 0) {
+      lines.push("", "### Findings");
+      for (const finding of ai.findings) {
+        lines.push("", `#### ${finding.title} (${finding.severity})`, "", finding.explanation);
+      }
+    }
+  }
+
+  if (report.errorMessage) {
+    lines.push("", `> Diagnostic: ${report.errorMessage}`);
+  }
+
+  const errors = report.errors ?? [];
+  lines.push("", "## Hard errors");
+  if (!errors.length) {
+    lines.push("", "No hard errors captured.");
+  } else {
+    for (const error of errors) {
+      lines.push(``, `- [${msToClock(error.timestamp)}] ${error.subtype}: ${error.message}`);
+    }
+  }
+
+  const assertions = report.assertions ?? [];
+  lines.push("", "## Assertions");
+  if (!assertions.length) {
+    lines.push("", "No assertions returned.");
+  } else {
+    for (const assertion of assertions) {
+      lines.push(
+        ``,
+        `- [${assertion.status}] ${assertion.name} (${msToClock(assertion.timestamp)})`,
+        `  - Expected: ${String(assertion.expected)}`,
+        `  - Actual: ${String(assertion.actual)}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function eventTypeLabel(type: string) {
+  const labels: Record<string, string> = {
+    "v2-final-test-completion": "Run completion",
+    "ai-agent-decision": "Test-worker decision",
+    "ai-agent-action": "Browser action",
+    "ai-agent-result": "Verified result",
+    "ai-agent-captured-evidence": "Evidence captured",
+    "ai-agent-assertion-passed": "Check passed",
+    "ai-agent-assertion-failed": "Check needs review",
+    "ai-agent-replan-required": "Test path adapted",
+    "ai-agent-replanned": "Test path updated",
+    "ai-agent-finished-scenario": "Scenario completed",
+    "v2-scenario-completed": "Scenario completed",
+    "v2-scenario-needs-review": "Scenario needs review",
+    "v2-scenario-blocked": "Scenario paused",
+    "run-outcome": "Run outcome recorded",
+    "bug-intelligence": "Finding reviewed",
+    "auth-completed": "Authentication checked",
+    "auth-failed-needs-review": "Authentication needs review",
+  };
+  if (labels[type]) return labels[type];
+  if (/^execution:/i.test(type)) {
+    const lifecycle = type.replace(/^execution:/i, "").replaceAll("-", " ");
+    return `Lifecycle · ${lifecycle}`;
+  }
+  if (/^ai-agent-/i.test(type)) return "Test-worker activity";
+  if (/^v2-/i.test(type)) return "Scenario activity";
+  return "Browser activity";
+}
+
+function eventLabel(e: {
+  type: string;
+  target?: string;
+  label?: string;
+  url?: string;
+  message?: string;
+}) {
+  const isInternal = (value: unknown) => typeof value === "string" && /^(ai-agent-|v2-|run-outcome|bug-intelligence|auth-)/i.test(value.trim());
+  return [e.target, e.label, e.message, e.url].find((value) => typeof value === "string" && value.trim() && !isInternal(value)) ?? eventTypeLabel(e.type);
+}
+function Stat({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: "danger" | "success";
+}) {
+  return (
+    <div className="surface-card p-4">
+      <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
+      <div
+        className={`mt-1 font-display text-2xl font-semibold ${tone === "danger" ? "text-destructive" : tone === "success" ? "text-primary" : ""}`}
+      >
+        {value}
+      </div>
+      <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{hint}</p>
+    </div>
+  );
+}
+function LoadingState() {
+  return (
+    <div className="mx-auto flex max-w-7xl items-center justify-center px-4 py-24 text-muted-foreground">
+      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+      Loading real run evidence…
+    </div>
+  );
+}
+function ErrorState({ message }: { message: string }) {
+  return (
+    <div className="mx-auto max-w-7xl px-4 py-16">
+      <div className="surface-card p-6">
+        <div className="flex items-center gap-2 text-destructive">
+          <XCircle className="h-5 w-5" />
+          <h2 className="font-display font-semibold">Unable to load run</h2>
+        </div>
+        <p className="mt-2 text-sm text-muted-foreground">{message}</p>
+      </div>
+    </div>
+  );
+}
+function EmptyState({
+  icon: Icon,
+  title,
+  body,
+  compact = false,
+}: {
+  icon: typeof Camera;
+  title: string;
+  body: string;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={`flex flex-col items-center justify-center text-center ${compact ? "p-8" : "min-h-[280px] p-10"}`}
+    >
+      <Icon className="h-6 w-6 text-muted-foreground" />
+      <h3 className="mt-3 text-sm font-semibold">{title}</h3>
+      <p className="mt-1 max-w-md text-xs text-muted-foreground">{body}</p>
+    </div>
+  );
+}
